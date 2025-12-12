@@ -161,6 +161,9 @@ def main():
     save_json(STATE_PATH, state)
     save_json(os.path.join(OUT_DIR, f"manifest_batch_{BATCH_INDEX}.json"), run_manifest)
 
+    # Exporta el estado actualizado para que otro job lo fusione y lo comitee
+    save_json(os.path.join(OUT_DIR, f"state_patch_batch_{BATCH_INDEX}.json"), state)
+
     print(json.dumps({
         "batch_index": BATCH_INDEX,
         "regions": len(my_batch),
