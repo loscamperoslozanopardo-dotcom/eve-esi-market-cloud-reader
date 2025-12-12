@@ -1,0 +1,43 @@
+name: Market Cloud Reader (Polite)
+
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: "*/30 * * * *"  # cada 30 min (conservador)
+
+permissions:
+  contents: read
+
+jobs:
+  run:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repo
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install deps
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+
+      - name: Run reader (batch)
+        env:
+          ESI_DATASOURCE: tranquility
+          USER_AGENT: eve-esi-market-cloud-reader (github: eve-esi-market-cloud-reader)
+          OUT_DIR: out
+          BATCH_SIZE: "2"
+          BATCH_INDEX: "0"
+        run: |
+          python src/market_reader.py
+
+      - name: Upload output (artifact)
+        uses: actions/upload-artifact@v4
+        with:
+          name: market-output
+          path: out/
+          retention-days: 3
