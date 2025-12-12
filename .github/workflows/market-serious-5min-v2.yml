@@ -32,7 +32,7 @@ jobs:
           USER_AGENT: "eve-esi-market-cloud-reader (scan)"
           STATE_PATH: state/market_state.json
           PLAN_PATH: plan/plan.json
-          BOOTSTRAP: "1"
+          BOOTSTRAP: "0"
         run: |
           python src/market_scan_plan.py
 
