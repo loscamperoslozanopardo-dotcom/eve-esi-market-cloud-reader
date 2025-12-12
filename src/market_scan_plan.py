@@ -14,6 +14,8 @@ PLAN_PATH = os.getenv("PLAN_PATH", "plan/plan.json")
 
 # Bootstrap: 1 = permitir snapshot inicial aunque no haya expirado (solo si no existe snapshot previo)
 BOOTSTRAP = os.getenv("BOOTSTRAP", "1") == "1"
+SAFETY_SECONDS = int(os.getenv("SAFETY_SECONDS", "10"))
+MAX_WAIT_SECONDS = int(os.getenv("MAX_WAIT_SECONDS", "120"))
 
 session = requests.Session()
 session.headers.update({"User-Agent": USER_AGENT, "Accept": "application/json"})
@@ -133,13 +135,59 @@ def main():
         return (exp_ts, -rec["weight_pages"])
 
     eligible_sorted = sorted(eligible, key=priority)
+    
+    # Si no hay elegibles y BOOTSTRAP está apagado, esperamos un poco para caer justo post-Expires.
+    sleep_seconds = 0
+    if (not BOOTSTRAP) and (len(eligible_sorted) == 0):
+        # Busca el próximo Expires más cercano (mínimo)
+        next_exp = None
+        for rec in plan_regions:
+            exp_dt = parse_http_date(rec.get("expires"))
+            if exp_dt is None:
+                continue
+            due_dt = exp_dt + timedelta(seconds=SAFETY_SECONDS)
+            if next_exp is None or due_dt < next_exp:
+                next_exp = due_dt
+    
+        if next_exp is not None:
+            delta = (next_exp - now_utc()).total_seconds()
+            if delta > 0:
+                sleep_seconds = int(min(delta, MAX_WAIT_SECONDS))
+                print(f"[INFO] No hay regiones elegibles. Durmiendo {sleep_seconds}s hasta próximo Expires+seguridad.")
+                time.sleep(sleep_seconds)
+    
+            # Recalcula elegibles SOLO con el estado ya leído (sin nuevas requests)
+            now2 = now_utc()
+            eligible2 = []
+            for rec in plan_regions:
+                exp_dt = parse_http_date(rec.get("expires"))
+                if exp_dt is None:
+                    continue
+                is_due2 = now2 >= (exp_dt + timedelta(seconds=SAFETY_SECONDS))
+                # respeta bootstrap apagado: solo due
+                if is_due2:
+                    rec["is_due"] = True
+                    rec["is_bootstrap"] = False
+                    eligible2.append(rec)
+    
+            # Prioridad igual que antes
+            def priority2(rec: Dict[str, Any]):
+                exp = parse_http_date(rec.get("expires"))
+                exp_ts = exp.timestamp() if exp else 0.0
+                return (exp_ts, -rec["weight_pages"])
+    
+            eligible_sorted = sorted(eligible2, key=priority2)
 
+    
+    
     plan = {
         "timestamp_utc": now.strftime("%Y-%m-%dT%H:%M:%SZ"),
         "regions_total": len(regions),
         "eligible_count": len(eligible_sorted),
         "eligible": eligible_sorted,
         "all_regions": plan_regions,
+        "sleep_seconds": sleep_seconds,
+        "safety_seconds": SAFETY_SECONDS,
         "notes": {
             "respect_expires": "No refrescar antes de Expires (ESI advierte contra circumvention).",
             "etag": "Usar If-None-Match/ETag; 304 => seguir usando datos previos y nuevos headers.",
