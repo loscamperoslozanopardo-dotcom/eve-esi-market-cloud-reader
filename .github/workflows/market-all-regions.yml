@@ -1,0 +1,90 @@
+name: Market - All Regions (Polite)
+
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: "0 */6 * * *"   # cada 6 horas (conservador)
+
+# Evita solapes: si entra otro run, cancela el anterior
+concurrency:
+  group: market-all-regions
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  discover:
+    runs-on: ubuntu-latest
+    outputs:
+      regions_json: ${{ steps.discover.outputs.regions_json }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+
+      - name: Discover regions
+        id: discover
+        run: |
+          python - << 'PY'
+          import json, requests
+          url = "https://esi.evetech.net/latest/universe/regions/"
+          r = requests.get(url, params={"datasource":"tranquility"}, timeout=45, headers={"User-Agent":"eve-esi-market-cloud-reader"})
+          r.raise_for_status()
+          regions = sorted(r.json())
+          # output para matrix (JSON)
+          print(f"regions count: {len(regions)}")
+          print("regions_json=" + json.dumps({"region_id": regions}))
+          PY
+          # guardar output en GITHUB_OUTPUT
+          echo "regions_json=$(python - << 'PY'
+          import json, requests
+          url = 'https://esi.evetech.net/latest/universe/regions/'
+          r = requests.get(url, params={'datasource':'tranquility'}, timeout=45, headers={'User-Agent':'eve-esi-market-cloud-reader'})
+          r.raise_for_status()
+          regions = sorted(r.json())
+          print(json.dumps({'region_id': regions}))
+          PY
+          )" >> $GITHUB_OUTPUT
+
+  fetch:
+    needs: discover
+    runs-on: ubuntu-latest
+
+    strategy:
+      fail-fast: false
+      max-parallel: 2
+      matrix: ${{ fromJson(needs.discover.outputs.regions_json) }}
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+
+      - name: Fetch region orders
+        env:
+          ESI_DATASOURCE: tranquility
+          USER_AGENT: "eve-esi-market-cloud-reader (github: eve-esi-market-cloud-reader)"
+          OUT_DIR: out
+          REGION_ID: ${{ matrix.region_id }}
+        run: |
+          python src/market_read_region.py
+
+      - name: Upload artifact (per region)
+        uses: actions/upload-artifact@v4
+        with:
+          name: market-region-${{ matrix.region_id }}
+          path: out/
+          retention-days: 3
