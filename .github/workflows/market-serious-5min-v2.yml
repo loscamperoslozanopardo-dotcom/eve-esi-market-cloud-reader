@@ -34,6 +34,7 @@ jobs:
           PLAN_PATH: plan/plan.json
           BOOTSTRAP: "0"
           SAFETY_SECONDS: "10"
+          MAX_WAIT_SECONDS: "120"
         run: |
           python src/market_scan_plan.py
 
@@ -99,3 +100,53 @@ jobs:
           name: market-worker-${{ matrix.batch_index }}
           path: out/
           retention-days: 2
+
+  merge_state:
+    needs: workers
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+
+      - name: Merge worker state patches into repo state
+        run: |
+          python - << 'PY'
+          import json, glob, os
+
+          state_path = "state/market_state.json"
+          os.makedirs("state", exist_ok=True)
+
+          if os.path.exists(state_path):
+            with open(state_path, "r", encoding="utf-8") as f:
+              base = json.load(f)
+          else:
+            base = {"regions": {}}
+
+          # Encuentra todos los state_patch_batch_*.json de los artifacts de workers
+          patches = glob.glob("artifacts/market-worker-*/out/state_patch_batch_*.json")
+          print("Patches encontrados:", len(patches))
+
+          for p in patches:
+            with open(p, "r", encoding="utf-8") as f:
+              patch = json.load(f)
+            # Merge simple por region_id
+            for rid, rec in patch.get("regions", {}).items():
+              base["regions"].setdefault(rid, {}).update(rec)
+
+          with open(state_path, "w", encoding="utf-8") as f:
+            json.dump(base, f, ensure_ascii=False, indent=2)
+
+          print("Merged OK")
+          PY
+
+      - name: Commit merged state
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add state/market_state.json
+          git commit -m "Merge market worker state" || exit 0
+          git push
+
