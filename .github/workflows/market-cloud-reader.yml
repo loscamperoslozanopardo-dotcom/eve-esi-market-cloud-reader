@@ -28,7 +28,7 @@ jobs:
       - name: Run reader (batch)
         env:
           ESI_DATASOURCE: tranquility
-          USER_AGENT: eve-esi-market-cloud-reader (github: eve-esi-market-cloud-reader)
+          USER_AGENT: "eve-esi-market-cloud-reader (github: eve-esi-market-cloud-reader)"
           OUT_DIR: out
           BATCH_SIZE: "2"
           BATCH_INDEX: "0"
