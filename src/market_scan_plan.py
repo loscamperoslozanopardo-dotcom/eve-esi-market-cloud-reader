@@ -1,7 +1,7 @@
 import json
 import os
 import time
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 from email.utils import parsedate_to_datetime
 from typing import Dict, Any, Optional, List
 import requests
@@ -102,7 +102,8 @@ def main():
         # elegible si:
         # - exp_dt existe y now >= exp_dt
         # - o bootstrap activo y no hay snapshot previo
-        is_due = (exp_dt is not None and now >= exp_dt)
+        SAFETY_SECONDS = int(os.getenv("SAFETY_SECONDS", "10"))
+        is_due = (exp_dt is not None and now >= (exp_dt + timedelta(seconds=SAFETY_SECONDS)))
         is_bootstrap = (BOOTSTRAP and (not has_snapshot))
 
         # Peso para planificar (X-Pages)
