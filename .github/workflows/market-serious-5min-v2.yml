@@ -33,6 +33,7 @@ jobs:
           STATE_PATH: state/market_state.json
           PLAN_PATH: plan/plan.json
           BOOTSTRAP: "0"
+          SAFETY_SECONDS: "10"
         run: |
           python src/market_scan_plan.py
 
