@@ -472,16 +472,8 @@ def main():
                 scan_errors += 1
                 state.setdefault("regions", {}).setdefault(str(rid), {})["last_error"] = f"scan failed: {e}"
 
-    if FORCE_FULL_SNAPSHOT:
-        to_fetch = scans
-        skipped = []
-        for s in to_fetch:
-            s.should_fetch = True
-            s.reason = "forced full snapshot"
-    else:
         to_fetch = [s for s in scans if s.should_fetch]
-        skipped = [s for s in scans if not s.should_fetch]
-
+        skipped  = [s for s in scans if not s.should_fetch]
 
     # 2) Reparto por páginas para balancear workers (LPT)
     bins = lpt_assign(to_fetch, WORKERS)
