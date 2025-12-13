@@ -39,6 +39,8 @@ jobs:
           STATE_FILE: "state/market_headers.json"
           BOOTSTRAP: "1"
           FORCE_VERIFY_AFTER_EXPIRES: "1"
+          INCONSISTENT_RETRY_ONCE: "1"
+          INCONSISTENT_RETRY_MAX_PAGES: "9999"
           ERROR_LIMIT_THRESHOLD: "20"
           MAX_RETRIES: "5"
           TIMEOUT_S: "60"
