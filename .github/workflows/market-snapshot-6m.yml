@@ -41,7 +41,7 @@ jobs:
           STATE_FILE: "out/state/market_headers.json"
           BOOTSTRAP: "1"
           FORCE_VERIFY_AFTER_EXPIRES: "1"
-          FORCE_FULL_SNAPSHOT: "1"
+          FORCE_FULL_SNAPSHOT: "0"
           ERROR_LIMIT_THRESHOLD: "20"
           MAX_RETRIES: "5"
           TIMEOUT_S: "60"
