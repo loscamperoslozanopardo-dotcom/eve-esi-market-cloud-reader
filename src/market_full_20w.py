@@ -324,7 +324,7 @@ def fetch_region(throttle: GlobalThrottle, state: Dict[str, Any], scan: RegionSc
                 f.write(json.dumps(o, separators=(",", ":"), ensure_ascii=False) + "\n")
             orders_count += len(page1_data)
 
-            # pages 2..N secuencial
+            # pages 2..N secuencial (una región = un worker)
             for page in range(2, x_pages + 1):
                 st, hdrs, data = request_json(
                     throttle, url,
@@ -340,22 +340,28 @@ def fetch_region(throttle: GlobalThrottle, state: Dict[str, Any], scan: RegionSc
                     f.write(json.dumps(o, separators=(",", ":"), ensure_ascii=False) + "\n")
                 orders_count += len(data)
 
-        # Éxito: solo aquí actualizamos baseline “snapshot last modified”
+        # Éxito: SOLO AQUÍ actualizamos baseline de snapshot
         entry = state.setdefault("regions", {}).setdefault(str(region_id), {})
         entry["last_full_snapshot_utc"] = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
-        entry["last_snapshot_last_modified"] = lm_ref or entry.get("last_modified_seen") or ""
+        if lm_ref:
+            entry["last_snapshot_last_modified"] = lm_ref
+        elif entry.get("last_modified_seen"):
+            entry["last_snapshot_last_modified"] = entry["last_modified_seen"]
 
         return RegionResult(region_id=region_id, ok=True, pages=x_pages, orders=orders_count, last_modified=lm_ref, tmp_path=tmp_path)
 
-    # Intento 0 y (si procede) intento 1
+    did_retry = False
+    last_err: Optional[str] = None
+
     attempts = 2 if INCONSISTENT_RETRY_ONCE else 1
 
-    last_err = None
     for attempt in range(attempts):
         try:
             _cleanup_tmp()
 
-            # Asegurar page1 + headers (si scan no trae body o queremos verificar)
+            # page 1:
+            # - intento 0: usa scan.page1_data si existe
+            # - intento 1 (retry): siempre re-hace page=1 sin If-None-Match para pillar el snapshot nuevo
             if scan.page1_data is None or attempt == 1:
                 st, hdrs, page1 = request_json(
                     throttle, url,
@@ -367,32 +373,36 @@ def fetch_region(throttle: GlobalThrottle, state: Dict[str, Any], scan: RegionSc
                     x_pages = int(x_pages_raw)
                 except ValueError:
                     x_pages = scan.x_pages
+
                 lm_ref = (hdrs.get("Last-Modified") or hdrs.get("last-modified") or scan.last_modified or "")
-                # actualizar “seen” (no baseline)
+
+                # registrar “seen” (NO baseline)
                 entry = state.setdefault("regions", {}).setdefault(str(region_id), {})
                 if lm_ref:
                     entry["last_modified_seen"] = lm_ref
-                scan_x_pages = x_pages
+
                 page1_data = page1
             else:
-                scan_x_pages = scan.x_pages
+                x_pages = scan.x_pages
                 page1_data = scan.page1_data
                 lm_ref = scan.last_modified or ""
 
-            # Si es enorme y quieres evitar dobles descargas, puedes limitar el retry por páginas:
-            if attempt == 1 and scan_x_pages > INCONSISTENT_RETRY_MAX_PAGES:
-                raise RuntimeError(f"Inconsistent snapshot (retry skipped: pages={scan_x_pages} > max={INCONSISTENT_RETRY_MAX_PAGES})")
+            # Si quieres limitar el retry por tamaño, usa INCONSISTENT_RETRY_MAX_PAGES
+            if attempt == 1 and x_pages > INCONSISTENT_RETRY_MAX_PAGES:
+                raise RuntimeError(f"Inconsistent snapshot (retry skipped: pages={x_pages} > max={INCONSISTENT_RETRY_MAX_PAGES})")
 
-            res = _download_with_page1(page1_data, scan_x_pages, lm_ref)
-            res.retried = (attempt == 1)
-            return res
+            rr = _download_with_page1(page1_data, x_pages, lm_ref)
+            rr.retried = did_retry
+            return rr
 
         except Exception as e:
             last_err = str(e)
-            # Solo reintentar si es inconsistencia y aún queda intento
+
+            # Solo reintentar 1 vez si la causa es inconsistencia
             if ("Inconsistent snapshot" in last_err) and (attempt == 0) and INCONSISTENT_RETRY_ONCE:
-                # reintento inmediato 1 vez
+                did_retry = True
                 continue
+
             break
 
     _cleanup_tmp()
@@ -404,7 +414,7 @@ def fetch_region(throttle: GlobalThrottle, state: Dict[str, Any], scan: RegionSc
         pages=scan.x_pages,
         orders=0,
         last_modified=scan.last_modified or "",
-        retried=(attempts == 2),  # intentamos retry (aunque fallara)
+        retried=did_retry,
         error=last_err,
         tmp_path=None
     )
