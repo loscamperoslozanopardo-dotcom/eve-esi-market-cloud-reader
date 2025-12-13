@@ -215,12 +215,20 @@ def scan_region(throttle: GlobalThrottle, state: Dict[str, Any], region_id: int)
     params = {"datasource": DATASOURCE, "order_type": "all", "page": "1"}
 
     entry = state.setdefault("regions", {}).setdefault(str(region_id), {})
+
+    # --- Migración suave de estado antiguo ---
+    # Si antes guardabas "last_modified" y ya había snapshot, úsalo como baseline de snapshot una vez.
+    if entry.get("last_full_snapshot_utc") and entry.get("last_modified") and not entry.get("last_snapshot_last_modified"):
+        entry["last_snapshot_last_modified"] = entry["last_modified"]
+
     prev_etag = entry.get("etag_page1")
-    prev_lm = entry.get("last_modified")
+    prev_seen_lm = entry.get("last_modified_seen")
+    last_snap_lm = entry.get("last_snapshot_last_modified")
+    has_snapshot = bool(entry.get("last_full_snapshot_utc"))
 
     headers = {}
     if prev_etag:
-        headers["If-None-Match"] = prev_etag
+        headers["If-None-Match"] = prev_etag  # ETag best practices 
 
     status, hdrs, data = request_json(throttle, url, params, headers=headers)
 
@@ -233,46 +241,45 @@ def scan_region(throttle: GlobalThrottle, state: Dict[str, Any], region_id: int)
     except ValueError:
         x_pages = 1
 
-    # Si es 304, normalmente no hay body; consideramos LM como el previo
-    if status == 304:
-        last_modified = last_modified or prev_lm
+    # 304 puede venir sin body; LM puede no venir también.
+    if status == 304 and not last_modified:
+        last_modified = prev_seen_lm
 
-    # Guardamos estado de headers (ETag Best Practices: guardar ETag independiente de expiry)
+    # Guardamos SIEMPRE "seen" (lo observado), NO implica snapshot correcto.
     if etag:
         entry["etag_page1"] = etag
     if expires:
         entry["expires"] = expires
     if last_modified:
-        entry["last_modified"] = last_modified
+        entry["last_modified_seen"] = last_modified
     entry["x_pages"] = x_pages
 
     exp_dt = parse_http_date(expires)
     expired = (exp_dt is None) or (now_utc() >= exp_dt)
 
-    has_snapshot = bool(entry.get("last_full_snapshot_utc"))
+    # Baseline correcto: solo el LM del ÚLTIMO snapshot exitoso.
+    baseline_lm = last_snap_lm if has_snapshot else None
+    changed_vs_snapshot = (not has_snapshot) or (baseline_lm is None) or (last_modified is None) or (last_modified != baseline_lm)
 
-    # Decisión: si LM no cambia, no refrescamos (tu requisito)
-    changed = (not has_snapshot) or (prev_lm is None) or (last_modified is None) or (last_modified != prev_lm)
-
-    # BOOTSTRAP: si no hay snapshot previo, sí o sí fetch
+    # Decisión respetuosa:
+    # - BOOTSTRAP: si no hay snapshot, descargamos (no es "forzar refresh", es "leer el snapshot actual").
+    # - Normal: solo descargamos cuando expired y cambió vs snapshot.
     if BOOTSTRAP and (not has_snapshot):
         should_fetch = True
         reason = "bootstrap (no snapshot previo)"
     else:
-        # Respetuoso: si no expiró y no cambió LM => skip
-        if (not expired) and (not changed):
+        if not expired:
             should_fetch = False
-            reason = "not expired + Last-Modified unchanged"
+            reason = "not expired"
         else:
-            should_fetch = changed
-            reason = "changed (Last-Modified)" if changed else "unchanged"
+            should_fetch = bool(changed_vs_snapshot)
+            reason = "expired + changed" if should_fetch else "expired + unchanged"
 
     page1_data = data if status == 200 else None
 
-    # Si ya expiró y recibimos 304, y tú quieres “verificar aunque cueste”:
-    # hacemos que el worker vuelva a pedir page=1 sin If-None-Match (para obtener body y LM seguro)
+    # Tu preferencia: si ya expiró y recibimos 304, hacemos verificación sin If-None-Match (1 vez).
     if should_fetch and expired and status == 304 and FORCE_VERIFY_AFTER_EXPIRES:
-        page1_data = None  # fuerza fetch de page1 sin conditional en fase de descarga
+        page1_data = None
 
     return RegionScan(
         region_id=region_id,
