@@ -497,9 +497,23 @@ def main():
     for th in threads:
         th.join()
 
-    # 4) Merge final a un único archivo
+    # 4) Merge final SOLO si hay regiones descargadas
+    if not results:
+        print("No hay regiones actualizadas → se mantiene el snapshot anterior")
+        save_json(os.path.join(OUT_DIR, "manifest.json"), {
+            "timestamp_utc": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+            "regions_total": len(regions),
+            "regions_to_fetch": 0,
+            "regions_ok": 0,
+            "orders_ok": 0,
+            "seconds": round(time.time() - t0, 3),
+            "note": "No changes detected; previous snapshot kept"
+        })
+        return
+    
     out_file = os.path.join(OUT_DIR, "market_orders_all.jsonl.gz")
     regions_ok, orders_ok = merge_to_single_file(tmp_dir, out_file, results)
+
 
     # Limpieza de temporales (dejas solo el archivo único final)
     shutil.rmtree(tmp_dir, ignore_errors=True)
