@@ -27,6 +27,8 @@ BOOTSTRAP = os.getenv("BOOTSTRAP", "1") == "1"
 # Tu preferencia: “prefiero perder unos segundos a que el ETag diga que no se ha actualizado”
 # => si Expires ya pasó y recibimos 304 en page=1, hacemos 1 verificación extra sin If-None-Match
 FORCE_VERIFY_AFTER_EXPIRES = os.getenv("FORCE_VERIFY_AFTER_EXPIRES", "1") == "1"
+INCONSISTENT_RETRY_ONCE = os.getenv("INCONSISTENT_RETRY_ONCE", "1") == "1"
+INCONSISTENT_RETRY_MAX_PAGES = int(os.getenv("INCONSISTENT_RETRY_MAX_PAGES", "9999"))
 
 # Control estricto de límites
 ERROR_LIMIT_THRESHOLD = int(os.getenv("ERROR_LIMIT_THRESHOLD", "20"))  # si baja de aquí, pausa
