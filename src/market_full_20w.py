@@ -298,44 +298,23 @@ def lpt_assign(regions: List[RegionScan], workers: int) -> List[List[RegionScan]
 def fetch_region(throttle: GlobalThrottle, state: Dict[str, Any], scan: RegionScan, tmp_dir: str) -> RegionResult:
     region_id = scan.region_id
     url = f"{ESI_BASE}/markets/{region_id}/orders/"
-
-    # temp file por región (si falla, se borra y no “contamina” el final)
     tmp_path = os.path.join(tmp_dir, f"region_{region_id}.jsonl")
 
-    try:
-        # page 1 (si no la tenemos del scan, la pedimos sin If-None-Match)
-        if scan.page1_data is None:
-            st, hdrs, page1 = request_json(
-                throttle, url,
-                {"datasource": DATASOURCE, "order_type": "all", "page": "1"},
-                headers={}
-            )
-            x_pages_raw = hdrs.get("X-Pages") or hdrs.get("x-pages") or str(scan.x_pages)
-            try:
-                x_pages = int(x_pages_raw)
-            except ValueError:
-                x_pages = scan.x_pages
-            lm_ref = (hdrs.get("Last-Modified") or hdrs.get("last-modified") or scan.last_modified or "")
-        else:
-            # Reusamos page1 del scan
-            x_pages = scan.x_pages
-            lm_ref = scan.last_modified or ""
+    def _cleanup_tmp():
+        try:
+            if os.path.exists(tmp_path):
+                os.remove(tmp_path)
+        except Exception:
+            pass
 
-            # Si queremos LM ref seguro y no vino en headers (raro), lo dejamos como "" y no validamos
+    def _download_with_page1(page1_data, x_pages: int, lm_ref: str) -> RegionResult:
         orders_count = 0
-
         with open(tmp_path, "w", encoding="utf-8") as f:
-            # Escribir page 1
-            if scan.page1_data is None:
-                data = page1
-            else:
-                data = scan.page1_data
-
-            for o in data:
+            # page 1
+            for o in page1_data:
                 o["region_id"] = region_id
-                # opcional: o["_lm"] = lm_ref
                 f.write(json.dumps(o, separators=(",", ":"), ensure_ascii=False) + "\n")
-            orders_count += len(data)
+            orders_count += len(page1_data)
 
             # pages 2..N secuencial
             for page in range(2, x_pages + 1):
@@ -353,22 +332,63 @@ def fetch_region(throttle: GlobalThrottle, state: Dict[str, Any], scan: RegionSc
                     f.write(json.dumps(o, separators=(",", ":"), ensure_ascii=False) + "\n")
                 orders_count += len(data)
 
-        # Marcar snapshot completo en estado
+        # Éxito: solo aquí actualizamos baseline “snapshot last modified”
         entry = state.setdefault("regions", {}).setdefault(str(region_id), {})
         entry["last_full_snapshot_utc"] = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+        entry["last_snapshot_last_modified"] = lm_ref or entry.get("last_modified_seen") or ""
 
         return RegionResult(region_id=region_id, ok=True, pages=x_pages, orders=orders_count, last_modified=lm_ref, tmp_path=tmp_path)
 
-    except Exception as e:
-        # borrar temp para no contaminar
+    # Intento 0 y (si procede) intento 1
+    attempts = 2 if INCONSISTENT_RETRY_ONCE else 1
+
+    last_err = None
+    for attempt in range(attempts):
         try:
-            if os.path.exists(tmp_path):
-                os.remove(tmp_path)
-        except Exception:
-            pass
-        entry = state.setdefault("regions", {}).setdefault(str(region_id), {})
-        entry["last_error"] = str(e)
-        return RegionResult(region_id=region_id, ok=False, pages=scan.x_pages, orders=0, last_modified=scan.last_modified or "", error=str(e), tmp_path=None)
+            _cleanup_tmp()
+
+            # Asegurar page1 + headers (si scan no trae body o queremos verificar)
+            if scan.page1_data is None or attempt == 1:
+                st, hdrs, page1 = request_json(
+                    throttle, url,
+                    {"datasource": DATASOURCE, "order_type": "all", "page": "1"},
+                    headers={}
+                )
+                x_pages_raw = hdrs.get("X-Pages") or hdrs.get("x-pages") or str(scan.x_pages)
+                try:
+                    x_pages = int(x_pages_raw)
+                except ValueError:
+                    x_pages = scan.x_pages
+                lm_ref = (hdrs.get("Last-Modified") or hdrs.get("last-modified") or scan.last_modified or "")
+                # actualizar “seen” (no baseline)
+                entry = state.setdefault("regions", {}).setdefault(str(region_id), {})
+                if lm_ref:
+                    entry["last_modified_seen"] = lm_ref
+                scan_x_pages = x_pages
+                page1_data = page1
+            else:
+                scan_x_pages = scan.x_pages
+                page1_data = scan.page1_data
+                lm_ref = scan.last_modified or ""
+
+            # Si es enorme y quieres evitar dobles descargas, puedes limitar el retry por páginas:
+            if attempt == 1 and scan_x_pages > INCONSISTENT_RETRY_MAX_PAGES:
+                raise RuntimeError(f"Inconsistent snapshot (retry skipped: pages={scan_x_pages} > max={INCONSISTENT_RETRY_MAX_PAGES})")
+
+            return _download_with_page1(page1_data, scan_x_pages, lm_ref)
+
+        except Exception as e:
+            last_err = str(e)
+            # Solo reintentar si es inconsistencia y aún queda intento
+            if ("Inconsistent snapshot" in last_err) and (attempt == 0) and INCONSISTENT_RETRY_ONCE:
+                # reintento inmediato 1 vez
+                continue
+            break
+
+    _cleanup_tmp()
+    entry = state.setdefault("regions", {}).setdefault(str(region_id), {})
+    entry["last_error"] = last_err or "unknown error"
+    return RegionResult(region_id=region_id, ok=False, pages=scan.x_pages, orders=0, last_modified=scan.last_modified or "", error=last_err, tmp_path=None)
 
 def merge_to_single_file(tmp_dir: str, out_path_gz: str, results: List[RegionResult]) -> Tuple[int, int]:
     ok_regions = [r for r in results if r.ok and r.tmp_path]
