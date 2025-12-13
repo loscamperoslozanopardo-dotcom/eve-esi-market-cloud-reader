@@ -1,0 +1,63 @@
+name: Market One-shot (20 workers, single file)
+
+on:
+  workflow_dispatch:
+  # Más adelante, cuando quieras cada 6 min, descomenta esto:
+  # schedule:
+  #   - cron: "*/6 * * * *"
+
+concurrency:
+  group: market-oneshot-20w
+  cancel-in-progress: true
+
+permissions:
+  contents: write
+
+jobs:
+  run:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install deps
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+
+      - name: Run collector (20 workers)
+        env:
+          ESI_DATASOURCE: tranquility
+          USER_AGENT: "eve-esi-market-cloud-reader (full-20w)"
+          WORKERS: "20"
+          OUT_DIR: "out"
+          STATE_FILE: "state/market_headers.json"
+          BOOTSTRAP: "1"
+          FORCE_VERIFY_AFTER_EXPIRES: "1"
+          ERROR_LIMIT_THRESHOLD: "20"
+          MAX_RETRIES: "5"
+          TIMEOUT_S: "60"
+        run: |
+          python src/market_full_20w.py
+
+      - name: Commit minimal state only
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add state/market_headers.json
+          git commit -m "Update ESI market header state" || exit 0
+          git push
+
+      - name: Upload artifact (single output file)
+        uses: actions/upload-artifact@v4
+        with:
+          name: market-oneshot-output
+          path: |
+            out/market_orders_all.jsonl.gz
+            out/manifest.json
+          retention-days: 2
