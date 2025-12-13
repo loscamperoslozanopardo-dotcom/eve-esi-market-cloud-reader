@@ -261,19 +261,22 @@ def scan_region(throttle: GlobalThrottle, state: Dict[str, Any], region_id: int)
     baseline_lm = last_snap_lm if has_snapshot else None
     changed_vs_snapshot = (not has_snapshot) or (baseline_lm is None) or (last_modified is None) or (last_modified != baseline_lm)
 
-    # Decisión respetuosa:
-    # - BOOTSTRAP: si no hay snapshot, descargamos (no es "forzar refresh", es "leer el snapshot actual").
-    # - Normal: solo descargamos cuando expired y cambió vs snapshot.
+    # Decisión correcta:
+    # - Si no hay snapshot previo: bootstrap
+    # - Si el Last-Modified ha cambiado respecto al último snapshot completo,
+    #   descargamos YA (aunque no haya expirado), porque el servidor
+    #   ya está sirviendo una representación nueva.
+    # - Si no cambió, no descargamos.
     if BOOTSTRAP and (not has_snapshot):
         should_fetch = True
         reason = "bootstrap (no snapshot previo)"
     else:
-        if not expired:
-            should_fetch = False
-            reason = "not expired"
+        if changed_vs_snapshot:
+            should_fetch = True
+            reason = "changed vs last snapshot (fetch now)"
         else:
-            should_fetch = bool(changed_vs_snapshot)
-            reason = "expired + changed" if should_fetch else "expired + unchanged"
+            should_fetch = False
+            reason = "unchanged vs last snapshot"
 
     page1_data = data if status == 200 else None
 
