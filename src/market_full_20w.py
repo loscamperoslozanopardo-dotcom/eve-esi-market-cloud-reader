@@ -376,7 +376,9 @@ def fetch_region(throttle: GlobalThrottle, state: Dict[str, Any], scan: RegionSc
             if attempt == 1 and scan_x_pages > INCONSISTENT_RETRY_MAX_PAGES:
                 raise RuntimeError(f"Inconsistent snapshot (retry skipped: pages={scan_x_pages} > max={INCONSISTENT_RETRY_MAX_PAGES})")
 
-            return _download_with_page1(page1_data, scan_x_pages, lm_ref)
+            res = _download_with_page1(page1_data, scan_x_pages, lm_ref)
+            res.retried = (attempt == 1)
+            return res
 
         except Exception as e:
             last_err = str(e)
@@ -389,7 +391,16 @@ def fetch_region(throttle: GlobalThrottle, state: Dict[str, Any], scan: RegionSc
     _cleanup_tmp()
     entry = state.setdefault("regions", {}).setdefault(str(region_id), {})
     entry["last_error"] = last_err or "unknown error"
-    return RegionResult(region_id=region_id, ok=False, pages=scan.x_pages, orders=0, last_modified=scan.last_modified or "", error=last_err, tmp_path=None)
+    return RegionResult(
+        region_id=region_id,
+        ok=False,
+        pages=scan.x_pages,
+        orders=0,
+        last_modified=scan.last_modified or "",
+        retried=(attempts == 2),  # intentamos retry (aunque fallara)
+        error=last_err,
+        tmp_path=None
+    )
 
 def merge_to_single_file(tmp_dir: str, out_path_gz: str, results: List[RegionResult]) -> Tuple[int, int]:
     ok_regions = [r for r in results if r.ok and r.tmp_path]
@@ -477,6 +488,7 @@ def main():
 
     # Manifest
     failed = [r for r in results if not r.ok]
+    retried_count = sum(1 for r in results if getattr(r, "retried", False))
     manifest = {
         "timestamp_utc": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
         "regions_total": len(regions),
@@ -485,6 +497,7 @@ def main():
         "regions_to_fetch": len(to_fetch),
         "regions_ok": regions_ok,
         "regions_failed": len(failed),
+        "regions_retried": retried_count,
         "orders_ok": orders_ok,
         "seconds": round(time.time() - t0, 3),
         "workers": WORKERS,
