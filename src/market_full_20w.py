@@ -19,6 +19,7 @@ USER_AGENT = os.getenv("USER_AGENT", "eve-esi-market-cloud-reader (full-20w)")
 WORKERS = int(os.getenv("WORKERS", "20"))
 OUT_DIR = os.getenv("OUT_DIR", "out")
 STATE_FILE = os.getenv("STATE_FILE", "state/market_headers.json")
+FORCE_FULL_SNAPSHOT = os.getenv("FORCE_FULL_SNAPSHOT", "0") == "1"
 
 # En la primera ejecución no hay estado: bajamos todo.
 # En runs posteriores, si Last-Modified no cambia, NO actualizamos región.
