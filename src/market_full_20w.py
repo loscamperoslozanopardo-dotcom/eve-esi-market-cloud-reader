@@ -201,6 +201,7 @@ class RegionResult:
     pages: int
     orders: int
     last_modified: str
+    retried: bool = False
     error: Optional[str] = None
     tmp_path: Optional[str] = None
 
