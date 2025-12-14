@@ -1,0 +1,158 @@
+name: Market Snapshot (6m) -> BigQuery (latest)
+
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: "*/6 * * * *"
+
+concurrency:
+  group: market-snapshot-and-load
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+  id-token: write
+
+env:
+  PROJECT_ID: eve-market-sandbox
+  PROJECT_NUMBER: "791118475780"
+  LOCATION: EU
+  DATASET_ID: eve_market
+  TABLE_LATEST: market_orders_latest
+  OUT_DIR: out
+  REQUIRED_REGION: "10000002"
+
+  # ESI
+  ESI_DATASOURCE: tranquility
+  USER_AGENT: "eve-esi-market-cloud-reader (github: loscamperoslozanopardo-dotcom/eve-esi-market-cloud-reader)"
+
+jobs:
+  snapshot_and_load:
+    runs-on: ubuntu-latest
+    timeout-minutes: 6
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install deps
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+
+      - name: Run market snapshot (full)
+        env:
+          WORKERS: "20"
+          STATE_FILE: "out/state/market_headers.json"
+          BOOTSTRAP: "1"
+          FORCE_VERIFY_AFTER_EXPIRES: "1"
+          FORCE_FULL_SNAPSHOT: "0"
+          ERROR_LIMIT_THRESHOLD: "20"
+          MAX_RETRIES: "5"
+          TIMEOUT_S: "60"
+        run: |
+          mkdir -p "${OUT_DIR}"
+          python src/market_full_20w.py
+
+      - name: Gate (check manifest requirements)
+        id: gate
+        run: |
+          python - <<'PY'
+          import json, os, sys
+
+          out_dir = os.environ.get("OUT_DIR", "out")
+          manifest_path = os.path.join(out_dir, "manifest.json")
+
+          if not os.path.exists(manifest_path):
+              print(f"::error::Missing manifest.json at {manifest_path}")
+              # si no hay manifest, el run no es válido
+              outp = os.environ.get("GITHUB_OUTPUT")
+              if outp:
+                  with open(outp, "a", encoding="utf-8") as f:
+                      f.write("load_ok=false\n")
+              sys.exit(1)
+
+          with open(manifest_path, "r", encoding="utf-8") as f:
+              m = json.load(f)
+
+          regions_to_fetch = int(m.get("regions_to_fetch", 0))
+          orders_ok = int(m.get("orders_ok", 0))
+
+          # Lee fallos de la forma REAL del manifest: failed_regions = [{region_id, error}, ...]
+          failed_ids_list = []
+          fr = m.get("failed_regions", [])
+          if isinstance(fr, list):
+              for item in fr:
+                  if isinstance(item, dict) and "region_id" in item:
+                      failed_ids_list.append(str(item["region_id"]))
+
+          # Compat: si algún día existiera regions_failed_ids, lo soportamos también
+          if not failed_ids_list:
+              legacy = m.get("regions_failed_ids", [])
+              if isinstance(legacy, list):
+                  failed_ids_list = [str(x) for x in legacy]
+              elif isinstance(legacy, int) and legacy > 0:
+                  failed_ids_list = ["__unknown__"]
+
+          required_region = str(os.environ.get("REQUIRED_REGION", "10000002"))
+
+          ok = (regions_to_fetch > 20 and orders_ok > 0 and required_region not in failed_ids_list)
+
+          print(f"regions_to_fetch={regions_to_fetch}")
+          print(f"orders_ok={orders_ok}")
+          print(f"failed_ids_count={len(failed_ids_list)}")
+          print(f"required_region_failed={required_region in failed_ids_list}")
+          print(f"LOAD_OK={ok}")
+
+          out_path = os.environ.get("GITHUB_OUTPUT")
+          if not out_path:
+              print("::error::GITHUB_OUTPUT not set")
+              sys.exit(1)
+
+          with open(out_path, "a", encoding="utf-8") as out:
+              out.write(f"load_ok={'true' if ok else 'false'}\n")
+          PY
+
+      - name: Skip BigQuery load (gate not passed)
+        if: steps.gate.outputs.load_ok != 'true'
+        run: |
+          echo "Gate did not pass -> NOT loading into BigQuery."
+
+      - name: Auth to Google Cloud (WIF)
+        if: steps.gate.outputs.load_ok == 'true'
+        uses: google-github-actions/auth@v3
+        with:
+          project_id: ${{ env.PROJECT_ID }}
+          workload_identity_provider: projects/${{ env.PROJECT_NUMBER }}/locations/global/workloadIdentityPools/eve-market-gh-pool/providers/github
+          service_account: eve-market-bq-loader@eve-market-sandbox.iam.gserviceaccount.com
+
+      - name: Setup gcloud
+        if: steps.gate.outputs.load_ok == 'true'
+        uses: google-github-actions/setup-gcloud@v2
+        with:
+          project_id: ${{ env.PROJECT_ID }}
+
+      - name: Load into BigQuery (overwrite latest)
+        if: steps.gate.outputs.load_ok == 'true'
+        run: |
+          bq --project_id="${PROJECT_ID}" --location="${LOCATION}" load \
+            --replace \
+            --source_format=NEWLINE_DELIMITED_JSON \
+            --autodetect \
+            "${PROJECT_ID}:${DATASET_ID}.${TABLE_LATEST}" \
+            "${OUT_DIR}/market_orders_all.jsonl.gz"
+
+      - name: Upload snapshot artifact (debug)
+        uses: actions/upload-artifact@v4
+        with:
+          name: market-latest
+          path: |
+            out/market_orders_all.jsonl.gz
+            out/manifest.json
+            out/state/market_headers.json
+          retention-days: 2
