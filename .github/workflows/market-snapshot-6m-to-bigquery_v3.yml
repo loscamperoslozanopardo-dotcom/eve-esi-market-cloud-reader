@@ -29,7 +29,7 @@ jobs:
       REQUIRED_REGION: "10000002"
 
       # ⚠️ AJUSTA SI TU PROVIDER NO SE LLAMA "github"
-      WIF_PROVIDER: projects/791118475780/locations/global/workloadIdentityPools/eve-market-gh-pool/providers/github
+      WIF_PROVIDER: projects/791118475780/locations/global/workloadIdentityPools/eve-market-gh-poolv2/providers/github
       SERVICE_ACCOUNT: eve-market-bq-loader@eve-market-sandbox.iam.gserviceaccount.com
 
       # ESI
