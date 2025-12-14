@@ -1,0 +1,147 @@
+name: Market Snapshot (6m) -> BigQuery (latest)
+
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: "*/100 * * * *"  # cada 100 min (GitHub cron va en UTC)
+
+permissions:
+  contents: read
+  id-token: write  # necesario para OIDC / Workload Identity Federation
+
+concurrency:
+  group: market-snapshot-6m
+  cancel-in-progress: true
+
+env:
+  PROJECT_ID: eve-market-sandbox
+  PROJECT_NUMBER: "791118475780"
+  LOCATION: EU
+  DATASET_ID: eve_market
+
+  TABLE_LATEST: market_orders_latest
+  TABLE_STAGING: market_orders__staging
+
+  OUT_DIR: out
+  REQUIRED_REGION: "10000002"
+
+  # ESI / tu extractor
+  ESI_DATASOURCE: tranquility
+  USER_AGENT: "eve-esi-market-cloud-reader (github: loscamperoslozanopardo-dotcom/eve-esi-market-cloud-reader)"
+
+jobs:
+  snapshot_and_load:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install deps
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+
+      # 1) Genera out/market_orders_all.jsonl.gz + out/manifest.json + out/state/market_headers.json
+      - name: Run snapshot (your existing command)
+        run: |
+          mkdir -p "${OUT_DIR}"
+          # IMPORTANTE: usa aquí el MISMO comando que ya te genera market_orders_all.jsonl.gz y manifest.json
+          # Ejemplo típico (ajústalo a tu repo si el script se llama distinto):
+          python src/market_full_20w.py
+
+      - name: Gate (check manifest requirements)
+        id: gate
+        run: |
+          python - << 'PY'
+          import json, sys
+
+          path = "out/manifest.json"
+          with open(path, "r", encoding="utf-8") as f:
+            m = json.load(f)
+
+          regions_to_fetch = int(m.get("regions_to_fetch", 0))
+          orders_ok = int(m.get("orders_ok", 0))
+
+          failed_ids = m.get("regions_failed_ids", [])
+          if failed_ids is None:
+            failed_ids = []
+          if isinstance(failed_ids, int):
+            # caso raro: si viniera como número, no podemos validar IDs -> tratamos como "hay fallos"
+            failed_ids_list = ["__unknown__"] if failed_ids > 0 else []
+          else:
+            failed_ids_list = [str(x) for x in failed_ids]
+
+          required_region = "10000002"
+          ok = (regions_to_fetch > 20 and orders_ok > 0 and required_region not in failed_ids_list)
+
+          print(f"regions_to_fetch={regions_to_fetch}")
+          print(f"orders_ok={orders_ok}")
+          print(f"failed_ids_count={len(failed_ids_list)}")
+          print(f"required_region_failed={required_region in failed_ids_list}")
+          print(f"LOAD_OK={ok}")
+
+          # output para pasos siguientes
+          with open(sys.argv[1], "a", encoding="utf-8") as out:
+            out.write(f"load_ok={'true' if ok else 'false'}\n")
+          PY
+          "$GITHUB_OUTPUT"
+
+      - name: Stop early (snapshot not good enough)
+        if: steps.gate.outputs.load_ok != 'true'
+        run: |
+          echo "Snapshot NO cumple requisitos. No se toca BigQuery."
+          exit 0
+
+      # 2) Auth a Google Cloud sin claves (WIF)
+      - name: Auth to Google Cloud (WIF)
+        uses: google-github-actions/auth@v2
+        with:
+          workload_identity_provider: projects/791118475780/locations/global/workloadIdentityPools/eve-market-gh-pool/providers/github
+          service_account: eve-market-bq-loader@eve-market-sandbox.iam.gserviceaccount.com
+
+      - name: Setup gcloud (includes bq)
+        uses: google-github-actions/setup-gcloud@v2
+        with:
+          project_id: eve-market-sandbox
+
+      - name: Decompress JSONL (faster loads if bandwidth allows)
+        run: |
+          gunzip -c "${OUT_DIR}/market_orders_all.jsonl.gz" > "${OUT_DIR}/market_orders_all.jsonl"
+
+      # 3) Load -> staging (sobrescribe completo; sin restos)
+      - name: Load to BigQuery staging (replace)
+        run: |
+          bq --location="${LOCATION}" load \
+            --replace \
+            --autodetect \
+            --source_format=NEWLINE_DELIMITED_JSON \
+            "${PROJECT_ID}:${DATASET_ID}.${TABLE_STAGING}" \
+            "${OUT_DIR}/market_orders_all.jsonl"
+
+      # 4) Promote staging -> latest (overwrite sin prompt)
+      - name: Promote staging to latest
+        run: |
+          bq --location="${LOCATION}" cp -f \
+            "${PROJECT_ID}:${DATASET_ID}.${TABLE_STAGING}" \
+            "${PROJECT_ID}:${DATASET_ID}.${TABLE_LATEST}"
+
+      # 5) Limpieza: borra staging para que solo exista "latest"
+      - name: Cleanup staging table
+        run: |
+          bq --location="${LOCATION}" rm -f -t \
+            "${PROJECT_ID}:${DATASET_ID}.${TABLE_STAGING}"
+
+      # Opcional: sube el snapshot como artifact para depurar
+      - name: Upload snapshot artifact (optional)
+        uses: actions/upload-artifact@v4
+        with:
+          name: market-latest
+          path: out/
+          retention-days: 3
