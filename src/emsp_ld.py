@@ -1,100 +1,201 @@
 import json
 import os
-import requests
-from google.cloud import bigquery
+import sys
 from datetime import datetime, timezone
-import time
+from typing import Any, Dict, Optional
 
-# Cargar las configuraciones necesarias
-PROJECT_ID = 'eve-market-sandbox'
-DATASET_ID = 'eve_market'
-TABLE_ID = 'markets_prices'
-TABLE_DT_ID = 'markets_prices_dt'
-STATE_FILE = 'state/emsp_hdrs.json'
+_THIS_DIR = os.path.dirname(__file__)
+_LIB_DIR = os.path.join(_THIS_DIR, "lib")
+if _LIB_DIR not in sys.path:
+    sys.path.insert(0, _LIB_DIR)
 
-# Variables de autenticación de BigQuery
-client = bigquery.Client(project=PROJECT_ID)
+from emsp_esi_http import (
+    fetch_markets_prices,
+    now_utc,
+    parse_http_date,
+)
+from emsp_bq_ld import (
+    ensure_dataset,
+    load_prices_to_bigquery_from_list,
+    write_prices_dt_table,
+)
 
-# Función para obtener el estado de headers desde el archivo persistente
-def load_headers():
-    if os.path.exists(STATE_FILE):
-        with open(STATE_FILE, 'r') as f:
+
+def _env_int(name: str, default: int) -> int:
+    try:
+        return int(os.getenv(name, str(default)))
+    except Exception:
+        return default
+
+
+def _env_bool(name: str, default: bool) -> bool:
+    v = os.getenv(name)
+    if v is None:
+        return default
+    return v.strip() in ("1", "true", "True", "yes", "YES")
+
+
+def _load_json(path: str, default: Any) -> Any:
+    try:
+        with open(path, "r", encoding="utf-8") as f:
             return json.load(f)
-    return {}
+    except Exception:
+        return default
 
-# Función para guardar el estado de headers en el archivo persistente
-def save_headers(headers):
-    with open(STATE_FILE, 'w') as f:
-        json.dump(headers, f)
 
-# Función para obtener la fecha actual en UTC
-def current_time_utc():
-    return datetime.now(timezone.utc).isoformat()
+def _save_json_atomic(path: str, obj: Any) -> None:
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    tmp = path + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as f:
+        json.dump(obj, f, ensure_ascii=False, indent=2)
+    os.replace(tmp, path)
 
-# Función para hacer la llamada a la API de ESI
-def fetch_market_prices():
-    url = 'https://esi.evetech.net/latest/markets/prices/?datasource=tranquility'
-    headers = load_headers()
-    etag = headers.get('etag', '')
 
-    response = requests.get(url, headers={'If-None-Match': etag})
-    
-    if response.status_code == 200:
-        return response.json(), response.headers
-    elif response.status_code == 304:
-        print("No new data, skipping load.")
-        return None, response.headers
-    else:
-        raise Exception(f"Failed to fetch data: {response.status_code}, {response.text}")
+def _iso_z(dt: datetime) -> str:
+    return dt.astimezone(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
 
-# Función para cargar datos en BigQuery
-def load_to_bigquery(data, table_id):
-    table_ref = client.dataset(DATASET_ID).table(table_id)
-    job_config = bigquery.LoadJobConfig(
-        schema=[
-            bigquery.SchemaField("type_id", "INT64"),
-            bigquery.SchemaField("average_price", "FLOAT64"),
-            bigquery.SchemaField("adjusted_price", "FLOAT64"),
-        ],
-        write_disposition="WRITE_TRUNCATE",  # Sobrescribe la tabla
+
+def main() -> int:
+    # ---- env (BQ)
+    project_id = os.getenv("PROJECT_ID", "eve-market-sandbox")
+    location = os.getenv("LOCATION", "EU")
+    dataset_id = os.getenv("DATASET_ID", "eve_market")
+    table_prices = os.getenv("TABLE_PRICES", "markets_prices")
+    table_prices_dt = os.getenv("TABLE_PRICES_DT", "markets_prices_dt")
+
+    # ---- env (ESI)
+    datasource = os.getenv("ESI_DATASOURCE", "tranquility")
+    user_agent = os.getenv("USER_AGENT", "eve-esi-market-cloud-reader (github actions)")
+
+    # ---- env (policy)
+    state_file = os.getenv("STATE_FILE", os.path.join("state", "emsp_hdrs.json"))
+    force_verify_after_expires = _env_bool("FORCE_VERIFY_AFTER_EXPIRES", True)
+
+    # ---- env (robust)
+    timeout_s = _env_int("TIMEOUT_S", 60)
+    max_retries = _env_int("MAX_RETRIES", 5)
+    error_limit_threshold = _env_int("ERROR_LIMIT_THRESHOLD", 20)
+
+    state: Dict[str, Any] = _load_json(state_file, {}) if state_file else {}
+    if not isinstance(state, dict):
+        state = {}
+
+    # Política Expires: si NO expiró y la política lo indica, no hacemos request.
+    prev_expires = state.get("expires")
+    prev_expires_dt = parse_http_date(prev_expires) if isinstance(prev_expires, str) else None
+    now = now_utc()
+
+    if force_verify_after_expires and prev_expires_dt and now < prev_expires_dt:
+        print(
+            json.dumps(
+                {
+                    "note": "skip_not_expired",
+                    "now_utc": _iso_z(now),
+                    "expires_utc": _iso_z(prev_expires_dt),
+                },
+                ensure_ascii=False,
+            )
+        )
+        return 0
+
+    # 1) Fetch ESI (usa If-None-Match / If-Modified-Since)
+    result = fetch_markets_prices(
+        prev_state=state,
+        datasource=datasource,
+        user_agent=user_agent,
+        timeout_s=timeout_s,
+        max_retries=max_retries,
+        error_limit_threshold=error_limit_threshold,
     )
-    
-    load_job = client.load_table_from_json(data, table_ref, job_config=job_config)
-    load_job.result()  # Espera hasta que el trabajo esté completo
-    print(f"Loaded {len(data)} rows to {table_id}")
 
-# Función para actualizar el timestamp de expiration en markets_prices_dt
-def update_expiration_dt(expires_utc):
-    table_ref = client.dataset(DATASET_ID).table(TABLE_DT_ID)
-    rows_to_insert = [{"expires_utc": expires_utc}]
-    
-    job_config = bigquery.LoadJobConfig(write_disposition="WRITE_TRUNCATE")
-    load_job = client.load_table_from_json(rows_to_insert, table_ref, job_config=job_config)
-    load_job.result()  # Espera hasta que el trabajo esté completo
-    print("Updated expiration timestamp in markets_prices_dt")
+    status = result["status"]
+    headers = result["headers"]
+    data = result["data"]
 
-def main():
-    # 1. Intentar obtener los datos de ESI
-    data, headers = fetch_market_prices()
-    
-    if data:
-        # 2. Cargar los datos en BigQuery
-        load_to_bigquery(data, TABLE_ID)
-        
-        # 3. Actualizar expiration timestamp en BigQuery
-        expires_utc = headers.get('Expires')
-        update_expiration_dt(expires_utc)
-        
-        # 4. Guardar headers persistentes (ETag, Last-Modified, Expires)
-        save_headers({
-            'etag': headers.get('ETag', ''),
-            'last_modified': headers.get('Last-Modified', ''),
-            'expires': expires_utc,
-            'last_success_request_utc': current_time_utc()
-        })
-        print("Run completed successfully.")
-    else:
-        print("No data to load, exiting.")
+    # Éxito ESI: 200 o 304 (ETag best practices)
+    if status not in (200, 304):
+        raise RuntimeError(f"Unexpected ESI status: {status}")
+
+    # 2) Validación Expires (requisito para markets_prices_dt)
+    expires = headers.get("Expires") or headers.get("expires")
+    expires_dt = parse_http_date(expires)
+    if not expires_dt:
+        raise RuntimeError("Missing/invalid Expires header on successful response; cannot write markets_prices_dt")
+
+    request_utc = now_utc()
+
+    # 3) BigQuery: dataset + dt table (siempre en éxito ESI)
+    ensure_dataset(project_id=project_id, dataset_id=dataset_id, location=location)
+    write_prices_dt_table(
+        project_id=project_id,
+        dataset_id=dataset_id,
+        table_id=table_prices_dt,
+        expires_dt=expires_dt,
+        location=location,
+    )
+
+    # 4) BigQuery: prices table SOLO si hay 200 con datos
+    loaded_rows: Optional[int] = None
+    if status == 200:
+        if not isinstance(data, list):
+            raise RuntimeError("ESI payload is not a list")
+        # Normaliza registros (y evita basura accidental)
+        cleaned = []
+        for item in data:
+            if not isinstance(item, dict):
+                continue
+            if "type_id" not in item:
+                continue
+            cleaned.append(
+                {
+                    "type_id": item.get("type_id"),
+                    "average_price": item.get("average_price"),
+                    "adjusted_price": item.get("adjusted_price"),
+                }
+            )
+        loaded_rows = load_prices_to_bigquery_from_list(
+            project_id=project_id,
+            dataset_id=dataset_id,
+            table_id=table_prices,
+            rows=cleaned,
+            location=location,
+        )
+
+    # 5) Persist state SOLO tras éxito (ESI ok + BQ ok)
+    # Guardamos headers relevantes y “hora de petición” solo si exitosa.
+    new_state = dict(state)
+    new_state["etag"] = headers.get("ETag") or headers.get("etag") or new_state.get("etag")
+    new_state["last_modified"] = headers.get("Last-Modified") or headers.get("last-modified") or new_state.get("last_modified")
+    new_state["expires"] = expires
+    new_state["last_success_request_utc"] = _iso_z(request_utc)
+    new_state["last_success_http_status"] = status
+    new_state["last_success_expires_utc"] = _iso_z(expires_dt)
+    if loaded_rows is not None:
+        new_state["last_success_loaded_rows"] = loaded_rows
+
+    if state_file:
+        _save_json_atomic(state_file, new_state)
+
+    # salida “visible”
+    print(
+        json.dumps(
+            {
+                "status": status,
+                "request_utc": _iso_z(request_utc),
+                "expires_utc": _iso_z(expires_dt),
+                "loaded_rows": loaded_rows,
+                "note": "bq_loaded" if status == 200 else "not_modified_304",
+            },
+            ensure_ascii=False,
+        )
+    )
+    return 0
+
 
 if __name__ == "__main__":
-    main()
+    try:
+        raise SystemExit(main())
+    except Exception as e:
+        # el workflow maneja el retry a los 5 min
+        print(f"::error::{type(e).__name__}: {e}")
+        raise
