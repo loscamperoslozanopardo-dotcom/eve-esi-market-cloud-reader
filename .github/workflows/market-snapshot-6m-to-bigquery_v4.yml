@@ -1,0 +1,185 @@
+name: Market Snapshot (6m) -> BigQuery (latest)
+
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: "*/6 * * * *"
+
+concurrency:
+  group: market-snapshot-and-bq
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+  id-token: write
+
+jobs:
+  snapshot_and_load:
+    runs-on: ubuntu-latest
+    timeout-minutes: 6
+
+    env:
+      PROJECT_ID: eve-market-sandbox
+      PROJECT_NUMBER: "791118475780"
+      LOCATION: EU
+      DATASET_ID: eve_market
+
+      TABLE_LATEST: market_orders_latest
+      TABLE_STAGING: market_orders__staging
+
+      OUT_DIR: out
+      REQUIRED_REGION: "10000002"
+
+      # WIF (POOL v2)
+      WIF_PROVIDER: projects/791118475780/locations/global/workloadIdentityPools/eve-market-gh-poolv2/providers/github
+      SERVICE_ACCOUNT: eve-market-bq-loader@eve-market-sandbox.iam.gserviceaccount.com
+
+      # ESI
+      ESI_DATASOURCE: tranquility
+      USER_AGENT: "eve-esi-market-cloud-reader (github: loscamperoslozanopardo-dotcom/eve-esi-market-cloud-reader)"
+      WORKERS: "20"
+      STATE_FILE: "out/state/market_headers.json"
+      BOOTSTRAP: "1"
+      FORCE_VERIFY_AFTER_EXPIRES: "1"
+      ERROR_LIMIT_THRESHOLD: "20"
+      MAX_RETRIES: "5"
+      TIMEOUT_S: "60"
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install deps
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+
+      - name: Run market snapshot (full)
+        run: |
+          mkdir -p "${OUT_DIR}"
+          python src/market_full_20w.py
+
+      - name: Gate (check manifest requirements)
+        id: gate
+        shell: bash
+        run: |
+          python - <<'PY'
+          import json, os, sys
+
+          out_dir = os.environ.get("OUT_DIR", "out")
+          manifest_path = os.path.join(out_dir, "manifest.json")
+
+          load_ok = False
+          if not os.path.exists(manifest_path):
+              print(f"::error::Missing manifest.json at {manifest_path}")
+          else:
+              with open(manifest_path, "r", encoding="utf-8") as f:
+                  m = json.load(f)
+
+              regions_to_fetch = int(m.get("regions_to_fetch", 0))
+              orders_ok = int(m.get("orders_ok", 0))
+
+              failed_ids = []
+              fr = m.get("failed_regions", [])
+              if isinstance(fr, list):
+                  for item in fr:
+                      if isinstance(item, dict) and "region_id" in item:
+                          failed_ids.append(str(item["region_id"]))
+
+              required_region = str(os.environ.get("REQUIRED_REGION", "10000002"))
+              load_ok = (regions_to_fetch > 20 and orders_ok > 0 and required_region not in failed_ids)
+
+              print(f"regions_to_fetch={regions_to_fetch}")
+              print(f"orders_ok={orders_ok}")
+              print(f"failed_ids_count={len(failed_ids)}")
+              print(f"required_region_failed={required_region in failed_ids}")
+              print(f"LOAD_OK={load_ok}")
+
+          out_path = os.environ.get("GITHUB_OUTPUT")
+          if not out_path:
+              print("::error::GITHUB_OUTPUT not set")
+              sys.exit(1)
+
+          with open(out_path, "a", encoding="utf-8") as out:
+              out.write(f"load_ok={'true' if load_ok else 'false'}\n")
+          PY
+
+      - name: Skip BigQuery load (gate not passed)
+        if: steps.gate.outputs.load_ok != 'true'
+        run: echo "Gate did not pass -> NOT loading into BigQuery."
+
+      - name: Auth to Google Cloud (WIF)
+        if: steps.gate.outputs.load_ok == 'true'
+        uses: google-github-actions/auth@v3
+        with:
+          project_id: ${{ env.PROJECT_ID }}
+          workload_identity_provider: ${{ env.WIF_PROVIDER }}
+          service_account: ${{ env.SERVICE_ACCOUNT }}
+          token_format: access_token
+          access_token_scopes: https://www.googleapis.com/auth/cloud-platform
+          create_credentials_file: true
+
+      - name: Setup gcloud
+        if: steps.gate.outputs.load_ok == 'true'
+        uses: google-github-actions/setup-gcloud@v2
+        with:
+          project_id: ${{ env.PROJECT_ID }}
+
+      - name: Load into BigQuery (staging -> latest, overwrite safely)
+        if: steps.gate.outputs.load_ok == 'true'
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          FILE="${OUT_DIR}/market_orders_all.jsonl.gz"
+          test -f "$FILE"
+
+          STAGING="${PROJECT_ID}:${DATASET_ID}.${TABLE_STAGING}"
+          LATEST="${PROJECT_ID}:${DATASET_ID}.${TABLE_LATEST}"
+
+          # 1) staging con schema (incluye region_id)
+          bq --location="${LOCATION}" query --use_legacy_sql=false "
+          CREATE OR REPLACE TABLE \`${PROJECT_ID}.${DATASET_ID}.${TABLE_STAGING}\` (
+            duration INT64,
+            is_buy_order BOOL,
+            issued TIMESTAMP,
+            location_id INT64,
+            min_volume INT64,
+            order_id INT64,
+            price FLOAT64,
+            range STRING,
+            system_id INT64,
+            type_id INT64,
+            volume_remain INT64,
+            volume_total INT64,
+            region_id INT64
+          );"
+
+          # 2) load a staging (REPLACE) desde GZIP JSONL
+          bq --location="${LOCATION}" load --replace \
+            --source_format=NEWLINE_DELIMITED_JSON \
+            --compression=GZIP \
+            --ignore_unknown_values \
+            "${STAGING}" "${FILE}"
+
+          # 3) swap atómico: latest = staging
+          bq --location="${LOCATION}" query --use_legacy_sql=false "
+          CREATE OR REPLACE TABLE \`${PROJECT_ID}.${DATASET_ID}.${TABLE_LATEST}\` AS
+          SELECT * FROM \`${PROJECT_ID}.${DATASET_ID}.${TABLE_STAGING}\`;"
+
+          # 4) limpia staging (opcional)
+          bq --location="${LOCATION}" rm -f -t "${STAGING}"
+
+      - name: Upload artifact (debug)
+        uses: actions/upload-artifact@v4
+        with:
+          name: market-latest-meta
+          path: |
+            out/manifest.json
+            out/state/market_headers.json
+          retention-days: 2
