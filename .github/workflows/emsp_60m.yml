@@ -59,7 +59,7 @@ jobs:
         uses: actions/cache@v4
         with:
           path: state/emsp_hdrs.json
-          # clave única por run para que se pueda "actualizar" (las caches son inmutables)
+          # caches son inmutables; key único por run, restore por prefijo
           key: emsp-hdrs-${{ github.run_id }}
           restore-keys: |
             emsp-hdrs-
@@ -73,6 +73,9 @@ jobs:
         run: |
           python -m pip install --upgrade pip
           pip install -r requirements.txt
+          # requerido por src/lib/emsp_bq_ld.py (import google.cloud.bigquery)
+          pip install google-cloud-bigquery
+          python -c "from google.cloud import bigquery; print('bigquery ok:', bigquery.__version__)"
 
       - name: Auth to Google Cloud (WIF)
         uses: google-github-actions/auth@v3
