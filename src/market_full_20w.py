@@ -1,53 +1,61 @@
-import gzip
-import json
 import os
-import shutil
-import threading
+import json
 import time
-from concurrent.futures import ThreadPoolExecutor, as_completed
+import gzip
+import shutil
+import random
+import threading
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from email.utils import parsedate_to_datetime
-from typing import Dict, Any, Optional, List, Tuple
+from typing import Any, Dict, List, Optional, Tuple
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
 import requests
+from requests.adapters import HTTPAdapter
 
 ESI_BASE = "https://esi.evetech.net/latest"
+
+# -------------------------
+# Config (env)
+# -------------------------
 DATASOURCE = os.getenv("ESI_DATASOURCE", "tranquility")
-USER_AGENT = os.getenv("USER_AGENT", "eve-esi-market-cloud-reader (full-20w)")
+USER_AGENT = os.getenv("USER_AGENT", "eve-esi-market-cloud-reader (github actions)")
+OUT_DIR = os.getenv("OUT_DIR", "out")
+STATE_FILE = os.getenv("STATE_FILE", os.path.join(OUT_DIR, "state", "market_headers.json"))
 
 WORKERS = int(os.getenv("WORKERS", "20"))
-OUT_DIR = os.getenv("OUT_DIR", "out")
-STATE_FILE = os.getenv("STATE_FILE", "state/market_headers.json")
+
+BOOTSTRAP = os.getenv("BOOTSTRAP", "0") == "1"
+FORCE_VERIFY_AFTER_EXPIRES = os.getenv("FORCE_VERIFY_AFTER_EXPIRES", "1") == "1"
 FORCE_FULL_SNAPSHOT = os.getenv("FORCE_FULL_SNAPSHOT", "0") == "1"
 
-# En la primera ejecución no hay estado: bajamos todo.
-# En runs posteriores, si Last-Modified no cambia, NO actualizamos región.
-BOOTSTRAP = os.getenv("BOOTSTRAP", "1") == "1"
-
-# Tu preferencia: “prefiero perder unos segundos a que el ETag diga que no se ha actualizado”
-# => si Expires ya pasó y recibimos 304 en page=1, hacemos 1 verificación extra sin If-None-Match
-FORCE_VERIFY_AFTER_EXPIRES = os.getenv("FORCE_VERIFY_AFTER_EXPIRES", "1") == "1"
-INCONSISTENT_RETRY_ONCE = os.getenv("INCONSISTENT_RETRY_ONCE", "1") == "1"
-INCONSISTENT_RETRY_MAX_PAGES = int(os.getenv("INCONSISTENT_RETRY_MAX_PAGES", "9999"))
-
-# Control estricto de límites
-ERROR_LIMIT_THRESHOLD = int(os.getenv("ERROR_LIMIT_THRESHOLD", "20"))  # si baja de aquí, pausa
+ERROR_LIMIT_THRESHOLD = int(os.getenv("ERROR_LIMIT_THRESHOLD", "20"))
 MAX_RETRIES = int(os.getenv("MAX_RETRIES", "5"))
 TIMEOUT_S = int(os.getenv("TIMEOUT_S", "60"))
 
-# Pausas pequeñas para no “martillear” y suavizar bursts (útil con rate limiting)
-MIN_DELAY = float(os.getenv("MIN_DELAY", "0.0"))
-MAX_DELAY = float(os.getenv("MAX_DELAY", "0.05"))
+# Inconsistencias (LM cambia dentro de una misma región mientras descargas páginas)
+INCONSISTENT_RETRY_ONCE = True
+
+# Rate-limit bucket protection (tokens)
+# Si Remaining baja mucho, pausamos un poco antes de provocar 429.
+RATELIMIT_SOFT_THRESHOLD = int(os.getenv("RATELIMIT_SOFT_THRESHOLD", "10"))
+RATELIMIT_SOFT_SLEEP_S = float(os.getenv("RATELIMIT_SOFT_SLEEP_S", "0.8"))
+
+# Micro-jitter para evitar “thundering herd”
+JITTER_MAX_S = float(os.getenv("JITTER_MAX_S", "0.12"))
+
+_session = None
+_session_lock = threading.Lock()
 
 def now_utc() -> datetime:
     return datetime.now(timezone.utc)
 
-def parse_http_date(value: Optional[str]) -> Optional[datetime]:
-    if not value:
+def parse_http_date(s: Optional[str]) -> Optional[datetime]:
+    if not s:
         return None
     try:
-        dt = parsedate_to_datetime(value)
+        dt = parsedate_to_datetime(s)
         if dt.tzinfo is None:
             dt = dt.replace(tzinfo=timezone.utc)
         return dt.astimezone(timezone.utc)
@@ -55,78 +63,103 @@ def parse_http_date(value: Optional[str]) -> Optional[datetime]:
         return None
 
 def load_json(path: str, default: Any) -> Any:
-    if os.path.exists(path):
+    try:
         with open(path, "r", encoding="utf-8") as f:
             return json.load(f)
-    return default
+    except Exception:
+        return default
 
 def save_json(path: str, obj: Any) -> None:
     os.makedirs(os.path.dirname(path), exist_ok=True)
-    with open(path, "w", encoding="utf-8") as f:
+    tmp = path + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as f:
         json.dump(obj, f, ensure_ascii=False, indent=2)
+    os.replace(tmp, path)
 
 def sleep_small():
-    if MAX_DELAY > 0:
-        import random
-        time.sleep(random.uniform(MIN_DELAY, MAX_DELAY))
-
-_thread_local = threading.local()
+    if JITTER_MAX_S > 0:
+        time.sleep(random.random() * JITTER_MAX_S)
 
 def get_session() -> requests.Session:
-    # Session por hilo (más seguro que compartirla)
-    sess = getattr(_thread_local, "sess", None)
-    if sess is None:
-        sess = requests.Session()
-        sess.headers.update({"User-Agent": USER_AGENT, "Accept": "application/json"})
-        _thread_local.sess = sess
-    return sess
+    global _session
+    if _session is not None:
+        return _session
+    with _session_lock:
+        if _session is not None:
+            return _session
+        s = requests.Session()
+        s.headers.update({
+            "User-Agent": USER_AGENT,
+            "Accept-Encoding": "gzip",
+        })
+        # Pool más grande para 20 workers
+        adapter = HTTPAdapter(pool_connections=64, pool_maxsize=64, max_retries=0)
+        s.mount("https://", adapter)
+        s.mount("http://", adapter)
+        _session = s
+        return _session
+
+def read_error_limit(headers: Dict[str, str]) -> Tuple[Optional[int], Optional[int]]:
+    # ESI error limit headers: X-ESI-Error-Limit-Remain / Reset
+    def _get(h: str) -> Optional[str]:
+        return headers.get(h) or headers.get(h.lower())
+
+    remain_s = _get("X-ESI-Error-Limit-Remain")
+    reset_s = _get("X-ESI-Error-Limit-Reset")
+    remain = None
+    reset = None
+    try:
+        if remain_s is not None:
+            remain = int(remain_s)
+    except Exception:
+        pass
+    try:
+        if reset_s is not None:
+            reset = int(float(reset_s))
+    except Exception:
+        pass
+    return remain, reset
+
+def read_bucket_remaining(headers: Dict[str, str]) -> Optional[int]:
+    # ESI bucket rate limit header: X-Ratelimit-Remaining
+    val = headers.get("X-Ratelimit-Remaining") or headers.get("x-ratelimit-remaining")
+    if val is None:
+        return None
+    try:
+        return int(val)
+    except Exception:
+        return None
 
 class GlobalThrottle:
-    """
-    Pausa GLOBAL para todos los workers cuando hay:
-    - 429 con Retry-After (rate limiting)
-    - error-limit bajo (X-ESI-Error-Limit-Remain/Reset)
-    """
     def __init__(self):
         self._lock = threading.Lock()
-        self._pause_until = 0.0  # time.monotonic
+        self._pause_until = 0.0
         self.events: List[Dict[str, Any]] = []
 
     def pause(self, seconds: float, reason: str, meta: Optional[Dict[str, Any]] = None):
-        until = time.monotonic() + max(0.0, seconds)
+        until = time.time() + max(0.0, seconds)
         with self._lock:
             if until > self._pause_until:
                 self._pause_until = until
-            self.events.append({
-                "ts_utc": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
-                "reason": reason,
-                "seconds": float(seconds),
-                "meta": meta or {}
-            })
+            evt = {"t": now_utc().strftime("%Y-%m-%dT%H:%M:%SZ"), "pause_s": round(seconds, 3), "reason": reason}
+            if meta:
+                evt["meta"] = meta
+            self.events.append(evt)
 
     def wait_if_needed(self):
         while True:
             with self._lock:
-                pause_until = self._pause_until
-            now = time.monotonic()
-            if now >= pause_until:
+                remaining = self._pause_until - time.time()
+            if remaining <= 0:
                 return
-            time.sleep(min(1.0, pause_until - now))
-
-def read_error_limit(headers: Dict[str, str]) -> Tuple[Optional[int], Optional[int]]:
-    remain = headers.get("X-ESI-Error-Limit-Remain") or headers.get("x-esi-error-limit-remain")
-    reset = headers.get("X-ESI-Error-Limit-Reset") or headers.get("x-esi-error-limit-reset")
-    try:
-        return (int(remain) if remain is not None else None,
-                int(reset) if reset is not None else None)
-    except ValueError:
-        return (None, None)
+            time.sleep(min(0.5, remaining))
 
 def request_json(throttle: GlobalThrottle, url: str, params: Dict[str, str], headers: Optional[Dict[str, str]] = None) -> Tuple[int, Dict[str, str], Any]:
     """
     Request robusto:
     - 429 => respeta Retry-After (pausa global) y reintenta
     - error-limit bajo => pausa global Reset+1
+    - bucket rate-limit bajo => micro-pausa preventiva (evita 429)
     - 5xx/timeouts => backoff con reintentos
     """
     sess = get_session()
@@ -138,44 +171,50 @@ def request_json(throttle: GlobalThrottle, url: str, params: Dict[str, str], hea
 
         try:
             r = sess.get(url, params=params, headers=headers or {}, timeout=TIMEOUT_S)
-        except requests.RequestException as e:
+        except requests.RequestException:
             if attempt == MAX_RETRIES:
                 raise
             time.sleep(backoff)
-            backoff = min(20.0, backoff * 2)
+            backoff = min(10.0, backoff * 2)
             continue
 
-        # Rate limit 429
+        hdrs = {k: v for k, v in r.headers.items()}
+
+        # 429: obey Retry-After
         if r.status_code == 429:
             ra = r.headers.get("Retry-After") or r.headers.get("retry-after") or "5"
             try:
                 wait_s = float(ra)
-            except ValueError:
+            except Exception:
                 wait_s = 5.0
             throttle.pause(wait_s + 0.5, "429 rate limited", {"retry_after": ra, "url": url})
             if attempt == MAX_RETRIES:
                 r.raise_for_status()
             continue
 
-        # Error limit (ESI Best Practices)
+        # Error limit protection (global ban protection)
         remain, reset = read_error_limit(r.headers)
         if remain is not None and remain <= ERROR_LIMIT_THRESHOLD:
             wait_s = float((reset or 10) + 1)
             throttle.pause(wait_s, "ESI error-limit low", {"remain": remain, "reset": reset})
+
+        # Bucket protection: if tokens low, slow down a bit
+        bucket_rem = read_bucket_remaining(r.headers)
+        if bucket_rem is not None and bucket_rem <= RATELIMIT_SOFT_THRESHOLD:
+            throttle.pause(RATELIMIT_SOFT_SLEEP_S, "ESI bucket low (soft)", {"remaining": bucket_rem})
 
         # 5xx retry
         if 500 <= r.status_code <= 599:
             if attempt == MAX_RETRIES:
                 r.raise_for_status()
             time.sleep(backoff)
-            backoff = min(20.0, backoff * 2)
+            backoff = min(10.0, backoff * 2)
             continue
 
-        # Otros 4xx (excepto 304 que tratamos fuera) => no reintentar en bucle
+        # Other 4xx (except 304)
         if 400 <= r.status_code <= 499 and r.status_code not in (304,):
             r.raise_for_status()
 
-        hdrs = {k: v for k, v in r.headers.items()}
         if r.status_code == 304:
             return 304, hdrs, None
 
@@ -217,8 +256,7 @@ def scan_region(throttle: GlobalThrottle, state: Dict[str, Any], region_id: int)
 
     entry = state.setdefault("regions", {}).setdefault(str(region_id), {})
 
-    # --- Migración suave de estado antiguo ---
-    # Si antes guardabas "last_modified" y ya había snapshot, úsalo como baseline de snapshot una vez.
+    # Migración suave si vienes de estado antiguo
     if entry.get("last_full_snapshot_utc") and entry.get("last_modified") and not entry.get("last_snapshot_last_modified"):
         entry["last_snapshot_last_modified"] = entry["last_modified"]
 
@@ -229,7 +267,7 @@ def scan_region(throttle: GlobalThrottle, state: Dict[str, Any], region_id: int)
 
     headers = {}
     if prev_etag:
-        headers["If-None-Match"] = prev_etag  # ETag best practices 
+        headers["If-None-Match"] = prev_etag  # ETag best practices
 
     status, hdrs, data = request_json(throttle, url, params, headers=headers)
 
@@ -239,14 +277,14 @@ def scan_region(throttle: GlobalThrottle, state: Dict[str, Any], region_id: int)
     x_pages_raw = hdrs.get("X-Pages") or hdrs.get("x-pages") or "1"
     try:
         x_pages = int(x_pages_raw)
-    except ValueError:
+    except Exception:
         x_pages = 1
 
-    # 304 puede venir sin body; LM puede no venir también.
+    # 304 puede venir sin LM
     if status == 304 and not last_modified:
         last_modified = prev_seen_lm
 
-    # Guardamos SIEMPRE "seen" (lo observado), NO implica snapshot correcto.
+    # Guardar estado de headers
     if etag:
         entry["etag_page1"] = etag
     if expires:
@@ -258,32 +296,37 @@ def scan_region(throttle: GlobalThrottle, state: Dict[str, Any], region_id: int)
     exp_dt = parse_http_date(expires)
     expired = (exp_dt is None) or (now_utc() >= exp_dt)
 
-    # Baseline correcto: solo el LM del ÚLTIMO snapshot exitoso.
-    baseline_lm = last_snap_lm if has_snapshot else None
-    changed_vs_snapshot = (not has_snapshot) or (baseline_lm is None) or (last_modified is None) or (last_modified != baseline_lm)
+    # Decidir si hay que descargar región
+    should_fetch = False
+    reason = "skip"
 
-    # Decisión correcta:
-    # - Si no hay snapshot previo: bootstrap
-    # - Si el Last-Modified ha cambiado respecto al último snapshot completo,
-    #   descargamos YA (aunque no haya expirado), porque el servidor
-    #   ya está sirviendo una representación nueva.
-    # - Si no cambió, no descargamos.
-    if BOOTSTRAP and (not has_snapshot):
+    if FORCE_FULL_SNAPSHOT or not has_snapshot:
         should_fetch = True
-        reason = "bootstrap (no snapshot previo)"
+        reason = "no_snapshot_or_forced"
     else:
-        if changed_vs_snapshot:
-            should_fetch = True
-            reason = "changed vs last snapshot (fetch now)"
+        # Si no ha expirado, lo normal es “no fetch”.
+        # Pero si FORCE_VERIFY_AFTER_EXPIRES=1, solo re-verificamos cuando expire.
+        if expired:
+            # Si ya tenemos snapshot y LM del snapshot coincide con LM actual, no hace falta refetch.
+            # (ETag/304 ya nos ayuda aquí)
+            if last_snap_lm and last_modified and last_modified == last_snap_lm:
+                should_fetch = False
+                reason = "expired_but_same_last_modified"
+            else:
+                should_fetch = True
+                reason = "expired_and_changed_or_unknown"
         else:
             should_fetch = False
-            reason = "unchanged vs last snapshot"
+            reason = "not_expired"
 
-    page1_data = data if status == 200 else None
+    # BOOTSTRAP: en el primer run, fuerzas todo
+    if BOOTSTRAP:
+        should_fetch = True
+        reason = "bootstrap"
 
-    # Tu preferencia: si ya expiró y recibimos 304, hacemos verificación sin If-None-Match (1 vez).
-    if should_fetch and expired and status == 304 and FORCE_VERIFY_AFTER_EXPIRES:
-        page1_data = None
+    page1_data = None
+    if status != 304:
+        page1_data = data
 
     return RegionScan(
         region_id=region_id,
@@ -298,7 +341,6 @@ def scan_region(throttle: GlobalThrottle, state: Dict[str, Any], region_id: int)
     )
 
 def lpt_assign(regions: List[RegionScan], workers: int) -> List[List[RegionScan]]:
-    # Longest Processing Time first: balance por páginas
     bins = [[] for _ in range(workers)]
     load = [0] * workers
     for r in sorted(regions, key=lambda x: x.x_pages, reverse=True):
@@ -328,7 +370,7 @@ def fetch_region(throttle: GlobalThrottle, state: Dict[str, Any], scan: RegionSc
                 f.write(json.dumps(o, separators=(",", ":"), ensure_ascii=False) + "\n")
             orders_count += len(page1_data)
 
-            # pages 2..N secuencial (una región = un worker)
+            # pages 2..N (secuencial dentro de región)
             for page in range(2, x_pages + 1):
                 st, hdrs, data = request_json(
                     throttle, url,
@@ -344,9 +386,9 @@ def fetch_region(throttle: GlobalThrottle, state: Dict[str, Any], scan: RegionSc
                     f.write(json.dumps(o, separators=(",", ":"), ensure_ascii=False) + "\n")
                 orders_count += len(data)
 
-        # Éxito: SOLO AQUÍ actualizamos baseline de snapshot
+        # Éxito: solo aquí “sellamos” snapshot
         entry = state.setdefault("regions", {}).setdefault(str(region_id), {})
-        entry["last_full_snapshot_utc"] = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+        entry["last_full_snapshot_utc"] = now_utc().strftime("%Y-%m-%dT%H:%M:%SZ")
         if lm_ref:
             entry["last_snapshot_last_modified"] = lm_ref
         elif entry.get("last_modified_seen"):
@@ -356,44 +398,30 @@ def fetch_region(throttle: GlobalThrottle, state: Dict[str, Any], scan: RegionSc
 
     did_retry = False
     last_err: Optional[str] = None
-
     attempts = 2 if INCONSISTENT_RETRY_ONCE else 1
 
     for attempt in range(attempts):
         try:
             _cleanup_tmp()
 
-            # page 1:
-            # - intento 0: usa scan.page1_data si existe
-            # - intento 1 (retry): siempre re-hace page=1 sin If-None-Match para pillar el snapshot nuevo
+            # Asegurar page1
             if scan.page1_data is None or attempt == 1:
                 st, hdrs, page1 = request_json(
                     throttle, url,
                     {"datasource": DATASOURCE, "order_type": "all", "page": "1"},
                     headers={}
                 )
-                x_pages_raw = hdrs.get("X-Pages") or hdrs.get("x-pages") or str(scan.x_pages)
+                lm_ref = (hdrs.get("Last-Modified") or hdrs.get("last-modified") or "")
+                x_pages_raw = hdrs.get("X-Pages") or hdrs.get("x-pages") or "1"
                 try:
                     x_pages = int(x_pages_raw)
-                except ValueError:
-                    x_pages = scan.x_pages
-
-                lm_ref = (hdrs.get("Last-Modified") or hdrs.get("last-modified") or scan.last_modified or "")
-
-                # registrar “seen” (NO baseline)
-                entry = state.setdefault("regions", {}).setdefault(str(region_id), {})
-                if lm_ref:
-                    entry["last_modified_seen"] = lm_ref
-
+                except Exception:
+                    x_pages = 1
                 page1_data = page1
             else:
-                x_pages = scan.x_pages
                 page1_data = scan.page1_data
                 lm_ref = scan.last_modified or ""
-
-            # Si quieres limitar el retry por tamaño, usa INCONSISTENT_RETRY_MAX_PAGES
-            if attempt == 1 and x_pages > INCONSISTENT_RETRY_MAX_PAGES:
-                raise RuntimeError(f"Inconsistent snapshot (retry skipped: pages={x_pages} > max={INCONSISTENT_RETRY_MAX_PAGES})")
+                x_pages = scan.x_pages
 
             rr = _download_with_page1(page1_data, x_pages, lm_ref)
             rr.retried = did_retry
@@ -401,38 +429,29 @@ def fetch_region(throttle: GlobalThrottle, state: Dict[str, Any], scan: RegionSc
 
         except Exception as e:
             last_err = str(e)
-
-            # Solo reintentar 1 vez si la causa es inconsistencia
-            if ("Inconsistent snapshot" in last_err) and (attempt == 0) and INCONSISTENT_RETRY_ONCE:
+            # Guardar error para inspección
+            state.setdefault("regions", {}).setdefault(str(region_id), {})["last_error"] = last_err
+            if "Inconsistent snapshot" in last_err and attempt == 0 and attempts == 2:
                 did_retry = True
+                # mini backoff antes del reintento
+                time.sleep(0.6)
                 continue
-
-            break
+            _cleanup_tmp()
+            return RegionResult(region_id=region_id, ok=False, pages=scan.x_pages, orders=0, last_modified=scan.last_modified or "", retried=did_retry, error=last_err)
 
     _cleanup_tmp()
-    entry = state.setdefault("regions", {}).setdefault(str(region_id), {})
-    entry["last_error"] = last_err or "unknown error"
-    return RegionResult(
-        region_id=region_id,
-        ok=False,
-        pages=scan.x_pages,
-        orders=0,
-        last_modified=scan.last_modified or "",
-        retried=did_retry,
-        error=last_err,
-        tmp_path=None
-    )
+    return RegionResult(region_id=region_id, ok=False, pages=scan.x_pages, orders=0, last_modified=scan.last_modified or "", retried=did_retry, error=last_err)
 
 def merge_to_single_file(tmp_dir: str, out_path_gz: str, results: List[RegionResult]) -> Tuple[int, int]:
     ok_regions = [r for r in results if r.ok and r.tmp_path]
-    # Orden estable por region_id (para reproducibilidad)
     ok_regions.sort(key=lambda r: r.region_id)
 
     out_tmp = out_path_gz + ".tmp"
     total_orders = 0
     total_regions = 0
 
-    with gzip.open(out_tmp, "wt", encoding="utf-8") as gz:
+    # compresslevel=1 => mucho más rápido (y suficiente para BQ)
+    with gzip.open(out_tmp, "wt", encoding="utf-8", compresslevel=1) as gz:
         for rr in ok_regions:
             total_regions += 1
             total_orders += rr.orders
@@ -455,7 +474,7 @@ def main():
 
     regions = get_regions(throttle)
 
-    # 1) Scan inicial page=1 de todas las regiones (para X-Pages + ETag/LM/Expires)
+    # 1) Scan inicial page=1 de todas las regiones
     scans: List[RegionScan] = []
     scan_errors = 0
 
@@ -472,10 +491,10 @@ def main():
                 scan_errors += 1
                 state.setdefault("regions", {}).setdefault(str(rid), {})["last_error"] = f"scan failed: {e}"
 
-        to_fetch = [s for s in scans if s.should_fetch]
-        skipped  = [s for s in scans if not s.should_fetch]
+    to_fetch = [s for s in scans if s.should_fetch]
+    skipped = [s for s in scans if not s.should_fetch]
 
-    # 2) Reparto por páginas para balancear workers (LPT)
+    # 2) Balanceo LPT
     bins = lpt_assign(to_fetch, WORKERS)
 
     results: List[RegionResult] = []
@@ -488,7 +507,7 @@ def main():
         with results_lock:
             results.extend(local)
 
-    # 3) 20 workers “región completa” (secuencial por páginas dentro de región)
+    # 3) Workers por región
     threads = []
     for b in bins:
         th = threading.Thread(target=worker_run, args=(b,), daemon=True)
@@ -499,33 +518,32 @@ def main():
 
     # 4) Merge final SOLO si hay regiones descargadas
     if not results:
-        print("No hay regiones actualizadas → se mantiene el snapshot anterior")
-        save_json(os.path.join(OUT_DIR, "manifest.json"), {
-            "timestamp_utc": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+        manifest = {
+            "timestamp_utc": now_utc().strftime("%Y-%m-%dT%H:%M:%SZ"),
             "regions_total": len(regions),
+            "scan_errors": scan_errors,
+            "regions_skipped": len(skipped),
             "regions_to_fetch": 0,
             "regions_ok": 0,
             "orders_ok": 0,
             "seconds": round(time.time() - t0, 3),
-            "note": "No changes detected; previous snapshot kept"
-        })
+            "note": "No changes detected; previous snapshot kept",
+        }
+        save_json(os.path.join(OUT_DIR, "manifest.json"), manifest)
+        save_json(STATE_FILE, state)
+        print(json.dumps(manifest, indent=2, ensure_ascii=False))
         return
-    
+
     out_file = os.path.join(OUT_DIR, "market_orders_all.jsonl.gz")
     regions_ok, orders_ok = merge_to_single_file(tmp_dir, out_file, results)
 
-
-    # Limpieza de temporales (dejas solo el archivo único final)
     shutil.rmtree(tmp_dir, ignore_errors=True)
-
-    # Guardar estado mínimo para el siguiente run (ETag/LM/Expires/x_pages + last_full_snapshot_utc)
     save_json(STATE_FILE, state)
 
-    # Manifest
     failed = [r for r in results if not r.ok]
     retried_count = sum(1 for r in results if getattr(r, "retried", False))
     manifest = {
-        "timestamp_utc": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+        "timestamp_utc": now_utc().strftime("%Y-%m-%dT%H:%M:%SZ"),
         "regions_total": len(regions),
         "scan_errors": scan_errors,
         "regions_skipped": len(skipped),
@@ -536,7 +554,7 @@ def main():
         "orders_ok": orders_ok,
         "seconds": round(time.time() - t0, 3),
         "workers": WORKERS,
-        "throttle_events": throttle.events[:50],  # primeras 50 (si hay muchas)
+        "throttle_events": throttle.events[:50],
         "failed_regions": [{"region_id": r.region_id, "error": r.error} for r in failed[:20]],
         "output_file": "market_orders_all.jsonl.gz",
         "notes": {
@@ -544,10 +562,11 @@ def main():
             "single_final_file": True,
             "strict_429_retry_after": True,
             "strict_error_limit_pause": True,
-        }
+            "soft_bucket_throttle": True,
+            "gzip_fast": True,
+        },
     }
     save_json(os.path.join(OUT_DIR, "manifest.json"), manifest)
-
     print(json.dumps(manifest, indent=2, ensure_ascii=False))
 
 if __name__ == "__main__":
