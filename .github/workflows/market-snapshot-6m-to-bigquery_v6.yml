@@ -1,4 +1,4 @@
-name: Market Snapshot (6m) -> BigQuery (latest)
+name: Market Snapshot (6m) -> BigQuery (latest) v6
 
 on:
   workflow_dispatch:
