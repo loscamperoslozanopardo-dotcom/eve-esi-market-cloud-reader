@@ -2,48 +2,107 @@ name: Markets Prices 60m
 
 on:
   schedule:
-    - cron: '0 * * * *'  # Ejecuta a la hora completa (cada 60 minutos)
-  workflow_dispatch:  # Para ejecutar manualmente
-    inputs:
-      trigger:  
-        description: 'Trigger the job'
-        required: true
-        default: 'true'
+    - cron: "0 * * * *" # cada hora
+  workflow_dispatch:
+
+concurrency:
+  group: emsp-60m
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+  id-token: write
 
 jobs:
   emsp_task:
     runs-on: ubuntu-latest
-    steps:
-      - name: Checkout repository
-        uses: actions/checkout@v2
+    timeout-minutes: 15
 
-      - name: Cache state (headers)
-        uses: actions/cache@v2
+    env:
+      # BigQuery
+      PROJECT_ID: eve-market-sandbox
+      PROJECT_NUMBER: "791118475780"
+      LOCATION: EU
+      DATASET_ID: eve_market
+      TABLE_PRICES: markets_prices
+      TABLE_PRICES_DT: markets_prices_dt
+
+      # WIF (mismo pool/provider que ya usas en el workflow 6m)
+      WIF_PROVIDER: projects/791118475780/locations/global/workloadIdentityPools/eve-market-gh-poolv2/providers/github
+      SERVICE_ACCOUNT: eve-market-bq-loader@eve-market-sandbox.iam.gserviceaccount.com
+
+      # ESI
+      ESI_DATASOURCE: tranquility
+      USER_AGENT: "eve-esi-market-cloud-reader (github: loscamperoslozanopardo-dotcom/eve-esi-market-cloud-reader)"
+
+      # Estado persistente (cache)
+      STATE_FILE: state/emsp_hdrs.json
+
+      # Robustez HTTP
+      TIMEOUT_S: "60"
+      MAX_RETRIES: "5"
+      ERROR_LIMIT_THRESHOLD: "20"
+
+      # Política: solo re-verificar cuando Expires haya vencido
+      FORCE_VERIFY_AFTER_EXPIRES: "1"
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Prepare folders
+        run: |
+          mkdir -p state out
+          if [ ! -f "${STATE_FILE}" ]; then echo '{}' > "${STATE_FILE}"; fi
+
+      - name: Restore state cache (headers)
+        uses: actions/cache@v4
         with:
           path: state/emsp_hdrs.json
-          key: ${{ runner.os }}-cache-${{ github.sha }}
+          # clave única por run para que se pueda "actualizar" (las caches son inmutables)
+          key: emsp-hdrs-${{ github.run_id }}
           restore-keys: |
-            ${{ runner.os }}-cache-
-      
+            emsp-hdrs-
+
       - name: Setup Python
-        uses: actions/setup-python@v2
+        uses: actions/setup-python@v5
         with:
-          python-version: '3.8'
-          
-      - name: Install dependencies
+          python-version: "3.12"
+
+      - name: Install deps
         run: |
           python -m pip install --upgrade pip
           pip install -r requirements.txt
 
-      - name: Run EMSP Load Job
-        run: |
-          python src/emsp_ld.py
+      - name: Auth to Google Cloud (WIF)
+        uses: google-github-actions/auth@v3
+        with:
+          project_id: ${{ env.PROJECT_ID }}
+          workload_identity_provider: ${{ env.WIF_PROVIDER }}
+          service_account: ${{ env.SERVICE_ACCOUNT }}
+          create_credentials_file: true
 
-      - name: Persist Headers in GitHub Cache
-        if: success()
+      - name: Run EMSP (one retry after 5m)
+        shell: bash
         run: |
-          git config --global user.name 'GitHub Actions'
-          git config --global user.email 'actions@github.com'
-          git add state/emsp_hdrs.json
-          git commit -m "Updated headers after successful run"
-          git push
+          set -euo pipefail
+          echo "Attempt 1..."
+          if python src/emsp_ld.py 2>&1 | tee out/emsp_run.log; then
+            exit 0
+          fi
+
+          echo "Attempt 1 failed; sleeping 300s then retry..."
+          sleep 300
+
+          echo "Attempt 2..."
+          python src/emsp_ld.py 2>&1 | tee -a out/emsp_run.log
+
+      - name: Upload debug artifact (only on failure)
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: emsp-debug
+          path: |
+            out/emsp_run.log
+            state/emsp_hdrs.json
+          retention-days: 2
