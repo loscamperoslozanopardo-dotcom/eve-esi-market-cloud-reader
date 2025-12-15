@@ -1,38 +1,49 @@
-name: Market Snapshot (6m) -> BigQuery (latest)
+name: Market Snapshot (6m) -> BigQuery (latest) v6
 
 on:
   workflow_dispatch:
   schedule:
-    - cron: "*/100 * * * *"  # cada 100 min (GitHub cron va en UTC)
+    - cron: "*/6 * * * *"
+
+concurrency:
+  group: market-snapshot-and-bq
+  cancel-in-progress: true
 
 permissions:
   contents: read
-  id-token: write  # necesario para OIDC / Workload Identity Federation
-
-concurrency:
-  group: market-snapshot-6m
-  cancel-in-progress: true
-
-env:
-  PROJECT_ID: eve-market-sandbox
-  PROJECT_NUMBER: "791118475780"
-  LOCATION: EU
-  DATASET_ID: eve_market
-
-  TABLE_LATEST: market_orders_latest
-  TABLE_STAGING: market_orders__staging
-
-  OUT_DIR: out
-  REQUIRED_REGION: "10000002"
-
-  # ESI / tu extractor
-  ESI_DATASOURCE: tranquility
-  USER_AGENT: "eve-esi-market-cloud-reader (github: loscamperoslozanopardo-dotcom/eve-esi-market-cloud-reader)"
+  id-token: write
 
 jobs:
   snapshot_and_load:
     runs-on: ubuntu-latest
-    timeout-minutes: 15
+    timeout-minutes: 6
+
+    env:
+      PROJECT_ID: eve-market-sandbox
+      PROJECT_NUMBER: "791118475780"
+      LOCATION: EU
+
+      DATASET_ID: eve_market
+      TABLE_LATEST: market_orders_latest
+      TABLE_STAGING: market_orders__staging
+
+      OUT_DIR: out
+      REQUIRED_REGION: "10000002"
+
+      # WIF (POOL v2)
+      WIF_PROVIDER: projects/791118475780/locations/global/workloadIdentityPools/eve-market-gh-poolv2/providers/github
+      SERVICE_ACCOUNT: eve-market-bq-loader@eve-market-sandbox.iam.gserviceaccount.com
+
+      # ESI
+      ESI_DATASOURCE: tranquility
+      USER_AGENT: "eve-esi-market-cloud-reader (github: loscamperoslozanopardo-dotcom/eve-esi-market-cloud-reader)"
+      WORKERS: "20"
+      STATE_FILE: "out/state/market_headers.json"
+      BOOTSTRAP: "1"
+      FORCE_VERIFY_AFTER_EXPIRES: "1"
+      ERROR_LIMIT_THRESHOLD: "20"
+      MAX_RETRIES: "5"
+      TIMEOUT_S: "60"
 
     steps:
       - name: Checkout
@@ -48,100 +59,126 @@ jobs:
           python -m pip install --upgrade pip
           pip install -r requirements.txt
 
-      # 1) Genera out/market_orders_all.jsonl.gz + out/manifest.json + out/state/market_headers.json
-      - name: Run snapshot (your existing command)
+      - name: Run market snapshot (full)
         run: |
           mkdir -p "${OUT_DIR}"
-          # IMPORTANTE: usa aquí el MISMO comando que ya te genera market_orders_all.jsonl.gz y manifest.json
-          # Ejemplo típico (ajústalo a tu repo si el script se llama distinto):
           python src/market_full_20w.py
 
       - name: Gate (check manifest requirements)
         id: gate
+        shell: bash
         run: |
-          python - << 'PY'
-          import json, sys
+          python - <<'PY'
+          import json, os
 
-          path = "out/manifest.json"
-          with open(path, "r", encoding="utf-8") as f:
-            m = json.load(f)
+          out_dir = os.environ.get("OUT_DIR", "out")
+          manifest_path = os.path.join(out_dir, "manifest.json")
 
-          regions_to_fetch = int(m.get("regions_to_fetch", 0))
-          orders_ok = int(m.get("orders_ok", 0))
+          load_ok = False
+          if os.path.exists(manifest_path):
+              with open(manifest_path, "r", encoding="utf-8") as f:
+                  m = json.load(f)
 
-          failed_ids = m.get("regions_failed_ids", [])
-          if failed_ids is None:
-            failed_ids = []
-          if isinstance(failed_ids, int):
-            # caso raro: si viniera como número, no podemos validar IDs -> tratamos como "hay fallos"
-            failed_ids_list = ["__unknown__"] if failed_ids > 0 else []
+              regions_to_fetch = int(m.get("regions_to_fetch", 0))
+              orders_ok = int(m.get("orders_ok", 0))
+
+              failed_ids = []
+              fr = m.get("failed_regions", [])
+              if isinstance(fr, list):
+                  for item in fr:
+                      if isinstance(item, dict) and "region_id" in item:
+                          failed_ids.append(str(item["region_id"]))
+
+              required_region = str(os.environ.get("REQUIRED_REGION", "10000002"))
+              load_ok = (regions_to_fetch > 20 and orders_ok > 0 and required_region not in failed_ids)
+
+              print(f"regions_to_fetch={regions_to_fetch}")
+              print(f"orders_ok={orders_ok}")
+              print(f"failed_ids_count={len(failed_ids)}")
+              print(f"required_region_failed={required_region in failed_ids}")
+              print(f"LOAD_OK={load_ok}")
           else:
-            failed_ids_list = [str(x) for x in failed_ids]
+              print(f"::error::Missing manifest.json at {manifest_path}")
 
-          required_region = "10000002"
-          ok = (regions_to_fetch > 20 and orders_ok > 0 and required_region not in failed_ids_list)
-
-          print(f"regions_to_fetch={regions_to_fetch}")
-          print(f"orders_ok={orders_ok}")
-          print(f"failed_ids_count={len(failed_ids_list)}")
-          print(f"required_region_failed={required_region in failed_ids_list}")
-          print(f"LOAD_OK={ok}")
-
-          # output para pasos siguientes
-          with open(sys.argv[1], "a", encoding="utf-8") as out:
-            out.write(f"load_ok={'true' if ok else 'false'}\n")
+          with open(os.environ["GITHUB_OUTPUT"], "a", encoding="utf-8") as out:
+              out.write(f"load_ok={'true' if load_ok else 'false'}\n")
           PY
-          "$GITHUB_OUTPUT"
 
-      - name: Stop early (snapshot not good enough)
+      - name: Skip BigQuery load (gate not passed)
         if: steps.gate.outputs.load_ok != 'true'
-        run: |
-          echo "Snapshot NO cumple requisitos. No se toca BigQuery."
-          exit 0
+        run: echo "Gate did not pass -> NOT loading into BigQuery."
 
-      # 2) Auth a Google Cloud sin claves (WIF)
       - name: Auth to Google Cloud (WIF)
-        uses: google-github-actions/auth@v2
+        if: steps.gate.outputs.load_ok == 'true'
+        uses: google-github-actions/auth@v3
         with:
-          workload_identity_provider: projects/791118475780/locations/global/workloadIdentityPools/eve-market-gh-pool/providers/github
-          service_account: eve-market-bq-loader@eve-market-sandbox.iam.gserviceaccount.com
+          project_id: ${{ env.PROJECT_ID }}
+          workload_identity_provider: ${{ env.WIF_PROVIDER }}
+          service_account: ${{ env.SERVICE_ACCOUNT }}
+          token_format: access_token
+          create_credentials_file: true
 
-      - name: Setup gcloud (includes bq)
+      - name: Setup gcloud
+        if: steps.gate.outputs.load_ok == 'true'
         uses: google-github-actions/setup-gcloud@v2
         with:
-          project_id: eve-market-sandbox
+          project_id: ${{ env.PROJECT_ID }}
 
-      - name: Decompress JSONL (faster loads if bandwidth allows)
+      - name: Load into BigQuery (staging -> latest, overwrite safely)
+        if: steps.gate.outputs.load_ok == 'true'
+        shell: bash
         run: |
-          gunzip -c "${OUT_DIR}/market_orders_all.jsonl.gz" > "${OUT_DIR}/market_orders_all.jsonl"
+          set -euo pipefail
 
-      # 3) Load -> staging (sobrescribe completo; sin restos)
-      - name: Load to BigQuery staging (replace)
-        run: |
-          bq --location="${LOCATION}" load \
-            --replace \
-            --autodetect \
+          GZ_FILE="${OUT_DIR}/market_orders_all.jsonl.gz"
+          JSONL_FILE="${OUT_DIR}/market_orders_all.jsonl"
+          test -f "${GZ_FILE}"
+
+          # bq.py legacy no soporta --compression, así que descomprimimos localmente
+          gunzip -c "${GZ_FILE}" > "${JSONL_FILE}"
+          test -s "${JSONL_FILE}"
+
+          STAGING="${PROJECT_ID}:${DATASET_ID}.${TABLE_STAGING}"
+
+          # 1) staging con schema (OJO: `range` es reservada => backticks)
+          bq --location="${LOCATION}" query --use_legacy_sql=false "
+          CREATE OR REPLACE TABLE \`${PROJECT_ID}.${DATASET_ID}.${TABLE_STAGING}\` (
+            duration INT64,
+            is_buy_order BOOL,
+            issued TIMESTAMP,
+            location_id INT64,
+            min_volume INT64,
+            order_id INT64,
+            price FLOAT64,
+            \`range\` STRING,
+            system_id INT64,
+            type_id INT64,
+            volume_remain INT64,
+            volume_total INT64,
+            region_id INT64
+          );"
+
+          # 2) load a staging (REPLACE) desde JSONL sin compresión
+          bq --location="${LOCATION}" load --replace \
             --source_format=NEWLINE_DELIMITED_JSON \
-            "${PROJECT_ID}:${DATASET_ID}.${TABLE_STAGING}" \
-            "${OUT_DIR}/market_orders_all.jsonl"
+            --ignore_unknown_values \
+            "${STAGING}" "${JSONL_FILE}"
 
-      # 4) Promote staging -> latest (overwrite sin prompt)
-      - name: Promote staging to latest
-        run: |
-          bq --location="${LOCATION}" cp -f \
-            "${PROJECT_ID}:${DATASET_ID}.${TABLE_STAGING}" \
-            "${PROJECT_ID}:${DATASET_ID}.${TABLE_LATEST}"
+          # 3) swap: latest = staging (sin restos)
+          bq --location="${LOCATION}" query --use_legacy_sql=false "
+          CREATE OR REPLACE TABLE \`${PROJECT_ID}.${DATASET_ID}.${TABLE_LATEST}\` AS
+          SELECT * FROM \`${PROJECT_ID}.${DATASET_ID}.${TABLE_STAGING}\`;"
 
-      # 5) Limpieza: borra staging para que solo exista "latest"
-      - name: Cleanup staging table
-        run: |
-          bq --location="${LOCATION}" rm -f -t \
-            "${PROJECT_ID}:${DATASET_ID}.${TABLE_STAGING}"
+          # 4) limpia staging y el jsonl temporal
+          bq --location="${LOCATION}" rm -f -t "${STAGING}"
+          rm -f "${JSONL_FILE}"
 
-      # Opcional: sube el snapshot como artifact para depurar
-      - name: Upload snapshot artifact (optional)
+      - name: Upload artifact (debug)
+        if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: market-latest
-          path: out/
-          retention-days: 3
+          name: market-latest-meta
+          path: |
+            out/manifest.json
+            out/state/market_headers.json
+          retention-days: 2
