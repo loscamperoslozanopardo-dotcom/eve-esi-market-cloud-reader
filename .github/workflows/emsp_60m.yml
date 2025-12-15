@@ -1,0 +1,49 @@
+name: Markets Prices 60m
+
+on:
+  schedule:
+    - cron: '0 * * * *'  # Ejecuta a la hora completa (cada 60 minutos)
+  workflow_dispatch:  # Para ejecutar manualmente
+    inputs:
+      trigger:  
+        description: 'Trigger the job'
+        required: true
+        default: 'true'
+
+jobs:
+  emsp_task:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v2
+
+      - name: Cache state (headers)
+        uses: actions/cache@v2
+        with:
+          path: state/emsp_hdrs.json
+          key: ${{ runner.os }}-cache-${{ github.sha }}
+          restore-keys: |
+            ${{ runner.os }}-cache-
+      
+      - name: Setup Python
+        uses: actions/setup-python@v2
+        with:
+          python-version: '3.8'
+          
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+
+      - name: Run EMSP Load Job
+        run: |
+          python src/emsp_ld.py
+
+      - name: Persist Headers in GitHub Cache
+        if: success()
+        run: |
+          git config --global user.name 'GitHub Actions'
+          git config --global user.email 'actions@github.com'
+          git add state/emsp_hdrs.json
+          git commit -m "Updated headers after successful run"
+          git push
