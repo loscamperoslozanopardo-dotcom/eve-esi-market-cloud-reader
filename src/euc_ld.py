@@ -375,7 +375,7 @@ def main() -> int:
     )
 
     # ---- env (policy)
-    state_file = os.getenv("STATE_FILE", os.path.join("state", "eus_hdrs.json"))
+    state_file = os.getenv("STATE_FILE", os.path.join("state", "euc_hdrs.json"))
     force_verify_after_expires = env_bool("FORCE_VERIFY_AFTER_EXPIRES", True)
 
     # ---- env (robust)
