@@ -2,7 +2,7 @@ name: EUC 1d
 
 on:
   schedule:
-    - cron: "9 11 * * *" # cada día 11:09 UTC (después del Expires diario típico de universe endpoints)
+    - cron: "9 11 * * *" # diario
   workflow_dispatch:
 
 concurrency:
@@ -21,9 +21,6 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
-      # Persistimos el estado (ETag/Last-Modified/Expires) entre runs mediante cache:
-      # - key único por run para forzar guardado
-      # - restore-keys por prefijo para recuperar el más reciente
       - name: Restore state cache
         uses: actions/cache@v4
         with:
