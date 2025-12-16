@@ -13,7 +13,7 @@ from google.cloud import bigquery
 
 
 # -----------------------------
-# ESI endpoints
+# ESI endpoints (constellations)
 # -----------------------------
 ESI_BASE_DEFAULT = "https://esi.evetech.net/latest"
 CONSTELLATIONS_LIST_PATH = "/universe/constellations/"
@@ -94,7 +94,6 @@ def load_constellations_to_bigquery_from_list(
     client = bigquery.Client(project=project_id)
     table_ref = f"{project_id}.{dataset_id}.{table_id}"
 
-    # Tabla "constellations" (creada por nosotros, no por ESI)
     job_config = bigquery.LoadJobConfig(
         schema=[
             bigquery.SchemaField("constellation_id", "INT64", mode="REQUIRED"),
@@ -107,7 +106,6 @@ def load_constellations_to_bigquery_from_list(
         ignore_unknown_values=True,
     )
 
-    # NDJSON in-memory (constellations ~1k; OK y simple)
     payload = (
         "\n".join(json.dumps(r, separators=(",", ":"), ensure_ascii=False) for r in rows)
         + "\n"
@@ -143,13 +141,12 @@ def write_constellations_dt_table(
             bigquery.ScalarQueryParameter("expires_utc", "TIMESTAMP", expires_dt)
         ]
     )
-
     job = client.query(sql, job_config=job_config, location=location)
     job.result()
 
 
 # -----------------------------
-# ESI HTTP (ESI caching + error-limit friendly)
+# ESI HTTP (with basic ESI error-limit protection)
 # -----------------------------
 def _read_int(headers: Dict[str, str], name: str) -> Optional[int]:
     v = headers.get(name) or headers.get(name.lower())
@@ -183,8 +180,8 @@ def _esi_get(
     error_limit_threshold: int,
     headers: Optional[Dict[str, str]] = None,
 ) -> Tuple[int, Dict[str, str], Optional[Any]]:
-    """
-    GET JSON from ESI with minimal retry/backoff.
+    """GET JSON from ESI with minimal retry/backoff.
+
     Returns: (status_code, response_headers, json_data_or_None)
     """
     sess = _session(user_agent)
@@ -217,16 +214,7 @@ def _esi_get(
             time.sleep(wait_s + 0.5)
             continue
 
-        # 420: "Error limited" (ESI)
-        if r.status_code == 420:
-            reset = _read_int(hdrs, "X-ESI-Error-Limit-Reset")
-            wait_s = float((reset or 10) + 1)
-            if attempt == max_retries:
-                r.raise_for_status()
-            time.sleep(wait_s)
-            continue
-
-        # ESI error-limit protection (global)
+        # ESI error-limit protection (best practices)
         remain = _read_int(hdrs, "X-ESI-Error-Limit-Remain")
         reset = _read_int(hdrs, "X-ESI-Error-Limit-Reset")
         if remain is not None and remain <= error_limit_threshold:
@@ -261,9 +249,7 @@ def fetch_constellations_list(
     max_retries: int,
     error_limit_threshold: int,
 ) -> Dict[str, Any]:
-    """
-    Fetch /universe/constellations/ using ETag/Last-Modified conditional headers.
-    """
+    """Fetch /universe/constellations/ with ETag/Last-Modified conditional headers."""
     url = f"{esi_base}{CONSTELLATIONS_LIST_PATH}"
 
     cond_headers: Dict[str, str] = {}
@@ -298,12 +284,7 @@ def fetch_constellation_info(
     max_retries: int,
     error_limit_threshold: int,
 ) -> Dict[str, Any]:
-    """
-    Fetch /universe/constellations/{constellation_id}/ and extract:
-      - name
-      - region_id
-    (El endpoint devuelve esos campos en el body).  :contentReference[oaicite:1]{index=1}
-    """
+    """Fetch /universe/constellations/{constellation_id}/ (body always needed; do NOT use 304)."""
     url = f"{esi_base}{CONSTELLATION_INFO_PATH_TMPL.format(constellation_id=constellation_id)}"
 
     status, _hdrs, data = _esi_get(
@@ -322,14 +303,16 @@ def fetch_constellation_info(
         )
 
     name = data.get("name")
+    region_id = data.get("region_id")
+
     if not isinstance(name, str) or not name:
         raise RuntimeError(f"Missing/invalid 'name' for constellation {constellation_id}")
-
-    region_id = data.get("region_id")
     try:
         region_id_int = int(region_id)
     except Exception:
-        raise RuntimeError(f"Missing/invalid 'region_id' for constellation {constellation_id}")
+        raise RuntimeError(
+            f"Missing/invalid 'region_id' for constellation {constellation_id}"
+        )
 
     return {
         "constellation_id": int(constellation_id),
@@ -397,7 +380,9 @@ def main() -> int:
     timeout_s = env_int("TIMEOUT_S", 60)
     max_retries = env_int("MAX_RETRIES", 5)
     error_limit_threshold = env_int("ERROR_LIMIT_THRESHOLD", 20)
-    workers = env_int("WORKERS", 10)
+
+    # Estimación razonable por defecto: 12, cap 20.
+    workers = env_int("WORKERS", 12)
     workers = max(1, min(workers, 20))
 
     cfg = RunConfig(
@@ -420,11 +405,12 @@ def main() -> int:
 
     state = _load_state(cfg.state_file)
 
-    # Expires policy (no consultar antes de "expires" para respetar caché)  :contentReference[oaicite:2]{index=2}
+    # Expires gate: si Expires está en el futuro, no hacemos requests.
     prev_expires = state.get("expires")
-    prev_expires_dt = parse_http_date(prev_expires) if isinstance(prev_expires, str) else None
+    prev_expires_dt = (
+        parse_http_date(prev_expires) if isinstance(prev_expires, str) else None
+    )
     now = now_utc()
-
     if cfg.force_verify_after_expires and prev_expires_dt and now < prev_expires_dt:
         print(
             json.dumps(
@@ -438,7 +424,7 @@ def main() -> int:
         )
         return 0
 
-    # 1) Fetch lista de constellation_id (ETag/304)  :contentReference[oaicite:3]{index=3}
+    # 1) Fetch constellations IDs list (conditional)
     res = fetch_constellations_list(
         prev_state=state,
         esi_base=cfg.esi_base,
@@ -459,11 +445,13 @@ def main() -> int:
     expires = headers.get("Expires") or headers.get("expires")
     expires_dt = parse_http_date(expires)
     if not expires_dt:
-        raise RuntimeError("Missing/invalid Expires header on successful response; cannot write constellations_dt")
+        raise RuntimeError(
+            "Missing/invalid Expires header on successful response; cannot write constellations_dt"
+        )
 
     request_utc = now_utc()
 
-    # 2) BigQuery: dataset + constellations_dt (1 fila)
+    # 2) BigQuery: ensure dataset and write constellations_dt (on any successful list response)
     ensure_dataset(project_id=cfg.project_id, dataset_id=cfg.dataset_id, location=cfg.location)
     write_constellations_dt_table(
         project_id=cfg.project_id,
@@ -475,7 +463,7 @@ def main() -> int:
 
     loaded_rows: Optional[int] = None
 
-    # 3) Si hay cambios (200), resolver detalles y reescribir constellations (WRITE_TRUNCATE)  :contentReference[oaicite:4]{index=4}
+    # 3) If modified (200), resolve names and region_id and rewrite constellations table
     if status == 200:
         if not isinstance(data, list):
             raise RuntimeError("ESI constellations list payload is not a list")
@@ -519,7 +507,9 @@ def main() -> int:
                     errors.append(str(e))
 
         if errors:
-            raise RuntimeError(f"Failed to fetch {len(errors)} constellation(s). Example: {errors[0]}")
+            raise RuntimeError(
+                f"Failed to fetch {len(errors)} constellation(s). Example: {errors[0]}"
+            )
 
         rows.sort(key=lambda r: int(r["constellation_id"]))
 
@@ -531,11 +521,15 @@ def main() -> int:
             location=cfg.location,
         )
 
-    # 4) Guardar estado sólo si ESI ok + BQ ok
+    # 4) Persist state ONLY after end-to-end success
     new_state = dict(state)
     new_state["etag"] = headers.get("ETag") or headers.get("etag") or new_state.get("etag")
-    new_state["last_modified"] = headers.get("Last-Modified") or headers.get("last-modified") or new_state.get("last_modified")
+    new_state["last_modified"] = (
+        headers.get("Last-Modified") or headers.get("last-modified") or new_state.get("last_modified")
+    )
     new_state["expires"] = expires
+
+    # “Impreso en algún sitio la hora de la petición sólo si ha sido exitosa”
     new_state["last_success_request_utc"] = iso_z(request_utc)
     new_state["last_success_http_status"] = status
     new_state["last_success_expires_utc"] = iso_z(expires_dt)
@@ -552,13 +546,12 @@ def main() -> int:
                 "request_utc": iso_z(request_utc),
                 "expires_utc": iso_z(expires_dt),
                 "loaded_rows": loaded_rows,
-                "workers": max_workers if status == 200 else 0,
+                "workers": min(cfg.workers, (len(data) if isinstance(data, list) else 0)) if status == 200 else 0,
                 "note": "bq_loaded" if status == 200 else "not_modified_304",
             },
             ensure_ascii=False,
         )
     )
-
     return 0
 
 
@@ -566,5 +559,6 @@ if __name__ == "__main__":
     try:
         raise SystemExit(main())
     except Exception as e:
+        # The workflow handles the 10-minute retries.
         print(f"::error::{type(e).__name__}: {e}")
         raise
