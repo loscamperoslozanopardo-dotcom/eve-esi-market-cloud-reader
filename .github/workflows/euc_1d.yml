@@ -2,7 +2,7 @@ name: EUC 1d
 
 on:
   schedule:
-    - cron: "9 11 * * *" # cada día 11:09 UTC (estas rutas “expiran” ~11:05)  # :contentReference[oaicite:5]{index=5}
+    - cron: "7 11 * * *" # cada día 11:07 UTC
   workflow_dispatch:
 
 concurrency:
@@ -16,7 +16,7 @@ permissions:
 jobs:
   euc_task:
     runs-on: ubuntu-latest
-    timeout-minutes: 30
+    timeout-minutes: 25
 
     env:
       # BigQuery
@@ -27,7 +27,7 @@ jobs:
       TABLE_CONSTELLATIONS: constellations
       TABLE_CONSTELLATIONS_DT: constellations_dt
 
-      # WIF (igual que en tus otros workflows)
+      # WIF (mismo pool/provider que ya usas en otros workflows)
       WIF_PROVIDER: projects/791118475780/locations/global/workloadIdentityPools/eve-market-gh-poolv2/providers/github
       SERVICE_ACCOUNT: eve-market-bq-loader@eve-market-sandbox.iam.gserviceaccount.com
 
@@ -40,15 +40,13 @@ jobs:
       # Estado persistente (cache)
       STATE_FILE: state/euc_hdrs.json
 
-      # Robustez HTTP / respeto error-limit
+      # Robustez HTTP
       TIMEOUT_S: "60"
       MAX_RETRIES: "5"
       ERROR_LIMIT_THRESHOLD: "20"
+      WORKERS: "12"
 
-      # Constellations ~1k: por defecto 10 workers (ajustable)
-      WORKERS: "10"
-
-      # Política: no re-verificar hasta que Expires haya vencido
+      # Política: solo re-verificar cuando Expires haya vencido
       FORCE_VERIFY_AFTER_EXPIRES: "1"
 
     steps:
@@ -64,6 +62,7 @@ jobs:
         uses: actions/cache@v4
         with:
           path: state/euc_hdrs.json
+          # caches son inmutables; key único por run, restore por prefijo
           key: euc-hdrs-${{ github.run_id }}
           restore-keys: |
             euc-hdrs-
@@ -77,6 +76,7 @@ jobs:
         run: |
           python -m pip install --upgrade pip
           pip install -r requirements.txt
+          # requerido por src/euc_ld.py (import google.cloud.bigquery)
           pip install google-cloud-bigquery
           python -c "from google.cloud import bigquery; print('bigquery ok:', bigquery.__version__)"
 
