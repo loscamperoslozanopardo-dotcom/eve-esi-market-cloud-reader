@@ -47,7 +47,7 @@ jobs:
       WORKERS: "12"
 
       # Política: solo re-verificar cuando Expires haya vencido
-      FORCE_VERIFY_AFTER_EXPIRES: "1"
+      FORCE_VERIFY_AFTER_EXPIRES: "0"
 
     steps:
       - name: Checkout
