@@ -1,0 +1,100 @@
+name: EUC 1d
+
+on:
+  schedule:
+    - cron: "9 11 * * *" # cada día 11:09 UTC (después del Expires diario típico de universe endpoints)
+  workflow_dispatch:
+
+concurrency:
+  group: euc-1d
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+  id-token: write
+
+jobs:
+  euc_1d:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      # Persistimos el estado (ETag/Last-Modified/Expires) entre runs mediante cache:
+      # - key único por run para forzar guardado
+      # - restore-keys por prefijo para recuperar el más reciente
+      - name: Restore state cache
+        uses: actions/cache@v4
+        with:
+          path: state/euc_hdrs.json
+          key: euc-hdrs-${{ github.run_id }}
+          restore-keys: |
+            euc-hdrs-
+
+      - name: Ensure folders
+        run: |
+          mkdir -p state out
+          if [ ! -f state/euc_hdrs.json ]; then
+            echo '{}' > state/euc_hdrs.json
+          fi
+
+      - name: Authenticate to Google Cloud (Workload Identity Federation)
+        uses: google-github-actions/auth@v2
+        with:
+          workload_identity_provider: ${{ secrets.GCP_WORKLOAD_IDENTITY_PROVIDER }}
+          service_account: ${{ secrets.GCP_SERVICE_ACCOUNT }}
+
+      - name: Setup gcloud
+        uses: google-github-actions/setup-gcloud@v2
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install deps
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install --upgrade requests google-cloud-bigquery
+
+      - name: Run EUC loader (with retries)
+        env:
+          PROJECT_ID: eve-market-sandbox
+          LOCATION: EU
+          DATASET_ID: eve_market
+          TABLE_SYSTEMS: systems
+          TABLE_SYSTEMS_DT: systems_dt
+          STATE_FILE: state/euc_hdrs.json
+          ESI_DATASOURCE: tranquility
+          ESI_LANGUAGE: en
+          FORCE_VERIFY_AFTER_EXPIRES: "true"
+          WORKERS: "20"
+        run: |
+          set -euo pipefail
+          attempt=1
+          max_attempts=3
+          while [ $attempt -le $max_attempts ]; do
+            echo "Attempt $attempt/$max_attempts" | tee -a out/euc_run.log
+            if python src/euc_ld.py 2>&1 | tee -a out/euc_run.log; then
+              echo "Run ok" | tee -a out/euc_run.log
+              exit 0
+            fi
+            if [ $attempt -eq $max_attempts ]; then
+              echo "Giving up after $max_attempts attempts" | tee -a out/euc_run.log
+              exit 1
+            fi
+            echo "Attempt $attempt failed; sleeping 600s then retry..." | tee -a out/euc_run.log
+            sleep 600
+            attempt=$((attempt+1))
+          done
+
+      - name: Upload debug artifact (only on failure)
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: euc-debug
+          path: |
+            out/euc_run.log
+            state/euc_hdrs.json
+          retention-days: 2
