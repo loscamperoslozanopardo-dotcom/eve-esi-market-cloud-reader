@@ -215,7 +215,7 @@ def _esi_get(
             time.sleep(wait_s + 0.5)
             continue
 
-        # ESI error-limit protection
+        # ESI error-limit protection (avoid getting blocked by error window)
         remain = _read_int(hdrs, "X-ESI-Error-Limit-Remain")
         reset = _read_int(hdrs, "X-ESI-Error-Limit-Reset")
         if remain is not None and remain <= error_limit_threshold:
@@ -236,7 +236,6 @@ def _esi_get(
         if r.status_code == 304:
             return 304, hdrs, None
 
-        # Any 2xx with JSON body
         return r.status_code, hdrs, r.json()
 
     raise RuntimeError("unreachable: retries loop exhausted")
@@ -405,8 +404,7 @@ def main() -> int:
 
     state = _load_state(cfg.state_file)
 
-    # Expires policy: if we have a valid Expires in state and it's still in the future,
-    # and policy is enabled, do nothing.
+    # If Expires in state is still in the future, skip calling ESI.
     prev_expires = state.get("expires")
     prev_expires_dt = (
         parse_http_date(prev_expires) if isinstance(prev_expires, str) else None
@@ -444,16 +442,23 @@ def main() -> int:
     if status not in (200, 304):
         raise RuntimeError(f"Unexpected ESI status for systems list: {status}")
 
+    # 2) Expires (for systems_dt)
     expires = headers.get("Expires") or headers.get("expires")
     expires_dt = parse_http_date(expires)
+
+    # Fallback: if 304 doesn't include Expires, reuse previous state expires (keeps pipeline robust).
+    if not expires_dt and status == 304 and prev_expires_dt:
+        expires_dt = prev_expires_dt
+        expires = prev_expires
+
     if not expires_dt:
         raise RuntimeError(
-            "Missing/invalid Expires header on successful response; cannot write systems_dt"
+            "Missing/invalid Expires header (and no valid fallback) on successful response; cannot write systems_dt"
         )
 
     request_utc = now_utc()
 
-    # 2) BigQuery: ensure dataset, write dt table (always for successful ESI list)
+    # 3) BigQuery: ensure dataset + write dt table (only on successful ESI list)
     ensure_dataset(
         project_id=cfg.project_id, dataset_id=cfg.dataset_id, location=cfg.location
     )
@@ -467,12 +472,11 @@ def main() -> int:
 
     loaded_rows: Optional[int] = None
 
-    # 3) If modified (200), resolve system names and rewrite systems table
+    # 4) If modified (200), resolve system names and rewrite systems table
     if status == 200:
         if not isinstance(data, list):
             raise RuntimeError("ESI systems list payload is not a list")
 
-        # Ensure we have integers
         system_ids: List[int] = []
         for x in data:
             try:
@@ -483,7 +487,6 @@ def main() -> int:
         if not system_ids:
             raise RuntimeError("ESI systems list returned no valid system IDs")
 
-        # Fetch system info in parallel
         from concurrent.futures import ThreadPoolExecutor, as_completed
 
         max_workers = min(cfg.workers, len(system_ids))
@@ -517,7 +520,6 @@ def main() -> int:
                 f"Failed to fetch {len(errors)} system(s). Example: {errors[0]}"
             )
 
-        # Stable ordering
         rows.sort(key=lambda r: int(r["system_id"]))
 
         loaded_rows = load_systems_to_bigquery_from_list(
@@ -528,7 +530,7 @@ def main() -> int:
             location=cfg.location,
         )
 
-    # 4) Persist state only after end-to-end success (ESI ok + BQ ok)
+    # 5) Persist state only after end-to-end success
     new_state = dict(state)
     new_state["etag"] = headers.get("ETag") or headers.get("etag") or new_state.get(
         "etag"
@@ -555,7 +557,7 @@ def main() -> int:
                 "request_utc": iso_z(request_utc),
                 "expires_utc": iso_z(expires_dt),
                 "loaded_rows": loaded_rows,
-                "workers": min(cfg.workers, (len(data) if isinstance(data, list) else 0))
+                "workers_used": min(cfg.workers, (len(data) if isinstance(data, list) else 0))
                 if status == 200
                 else 0,
                 "note": "bq_loaded" if status == 200 else "not_modified_304",
@@ -571,6 +573,5 @@ if __name__ == "__main__":
     try:
         raise SystemExit(main())
     except Exception as e:
-        # The workflow handles the 10-minute retries.
         print(f"::error::{type(e).__name__}: {e}")
         raise
