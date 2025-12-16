@@ -2,7 +2,7 @@ name: EVE Universe Constellations 11:07 UTC
 
 on:
   schedule:
-    - cron: "9 11 * * *" # diario
+    - cron: "7 11 * * *" # cada día 11:07 UTC
   workflow_dispatch:
 
 concurrency:
@@ -16,34 +16,56 @@ permissions:
 jobs:
   euc_1d:
     runs-on: ubuntu-latest
+    timeout-minutes: 25
+
+    env:
+      # BigQuery
+      PROJECT_ID: eve-market-sandbox
+      PROJECT_NUMBER: "791118475780"
+      LOCATION: EU
+      DATASET_ID: eve_market
+      TABLE_SYSTEMS: systems
+      TABLE_SYSTEMS_DT: systems_dt
+
+      # WIF (mismo pool/provider que ya usas en otros workflows)
+      WIF_PROVIDER: projects/791118475780/locations/global/workloadIdentityPools/eve-market-gh-poolv2/providers/github
+      SERVICE_ACCOUNT: eve-market-bq-loader@eve-market-sandbox.iam.gserviceaccount.com
+
+      # ESI
+      ESI_BASE: https://esi.evetech.net/latest
+      ESI_DATASOURCE: tranquility
+      ESI_LANGUAGE: en
+      USER_AGENT: "eve-esi-market-cloud-reader (github: loscamperoslozanopardo-dotcom/eve-esi-market-cloud-reader)"
+
+      # Estado persistente (cache)
+      STATE_FILE: state/euc_hdrs.json
+
+      # Robustez HTTP
+      TIMEOUT_S: "60"
+      MAX_RETRIES: "5"
+      ERROR_LIMIT_THRESHOLD: "20"
+      WORKERS: "20"
+
+      # Política: solo re-verificar cuando Expires haya vencido
+      FORCE_VERIFY_AFTER_EXPIRES: "1"
 
     steps:
       - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Restore state cache
+      - name: Prepare folders
+        run: |
+          mkdir -p state out
+          if [ ! -f "${STATE_FILE}" ]; then echo '{}' > "${STATE_FILE}"; fi
+
+      - name: Restore state cache (headers)
         uses: actions/cache@v4
         with:
-          path: state/euc_hdrs.json
+          path: ${{ env.STATE_FILE }}
+          # caches son inmutables; key único por run, restore por prefijo
           key: euc-hdrs-${{ github.run_id }}
           restore-keys: |
             euc-hdrs-
-
-      - name: Ensure folders
-        run: |
-          mkdir -p state out
-          if [ ! -f state/euc_hdrs.json ]; then
-            echo '{}' > state/euc_hdrs.json
-          fi
-
-      - name: Authenticate to Google Cloud (Workload Identity Federation)
-        uses: google-github-actions/auth@v2
-        with:
-          workload_identity_provider: ${{ secrets.GCP_WORKLOAD_IDENTITY_PROVIDER }}
-          service_account: ${{ secrets.GCP_SERVICE_ACCOUNT }}
-
-      - name: Setup gcloud
-        uses: google-github-actions/setup-gcloud@v2
 
       - name: Setup Python
         uses: actions/setup-python@v5
@@ -53,34 +75,40 @@ jobs:
       - name: Install deps
         run: |
           python -m pip install --upgrade pip
-          python -m pip install --upgrade requests google-cloud-bigquery
+          pip install -r requirements.txt
+          # requerido por src/euc_ld.py (import google.cloud.bigquery)
+          pip install google-cloud-bigquery
+          python -c "from google.cloud import bigquery; print('bigquery ok:', bigquery.__version__)"
 
-      - name: Run EUC loader (with retries)
-        env:
-          PROJECT_ID: eve-market-sandbox
-          LOCATION: EU
-          DATASET_ID: eve_market
-          TABLE_SYSTEMS: systems
-          TABLE_SYSTEMS_DT: systems_dt
-          STATE_FILE: state/euc_hdrs.json
-          ESI_DATASOURCE: tranquility
-          ESI_LANGUAGE: en
-          FORCE_VERIFY_AFTER_EXPIRES: "true"
-          WORKERS: "20"
+      - name: Auth to Google Cloud (WIF)
+        uses: google-github-actions/auth@v3
+        with:
+          project_id: ${{ env.PROJECT_ID }}
+          workload_identity_provider: ${{ env.WIF_PROVIDER }}
+          service_account: ${{ env.SERVICE_ACCOUNT }}
+          create_credentials_file: true
+
+      - name: Run EUC (3 retries, 10m apart)
+        shell: bash
         run: |
           set -euo pipefail
+
+          max_attempts=4   # 1 + 3 retries
           attempt=1
-          max_attempts=3
-          while [ $attempt -le $max_attempts ]; do
-            echo "Attempt $attempt/$max_attempts" | tee -a out/euc_run.log
+
+          : > out/euc_run.log
+
+          while [ "$attempt" -le "$max_attempts" ]; do
+            echo "Attempt $attempt/$max_attempts..." | tee -a out/euc_run.log
             if python src/euc_ld.py 2>&1 | tee -a out/euc_run.log; then
-              echo "Run ok" | tee -a out/euc_run.log
               exit 0
             fi
-            if [ $attempt -eq $max_attempts ]; then
-              echo "Giving up after $max_attempts attempts" | tee -a out/euc_run.log
+
+            if [ "$attempt" -eq "$max_attempts" ]; then
+              echo "All attempts failed." | tee -a out/euc_run.log
               exit 1
             fi
+
             echo "Attempt $attempt failed; sleeping 600s then retry..." | tee -a out/euc_run.log
             sleep 600
             attempt=$((attempt+1))
