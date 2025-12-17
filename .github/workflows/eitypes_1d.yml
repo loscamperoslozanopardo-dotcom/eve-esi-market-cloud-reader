@@ -1,0 +1,110 @@
+name: EVE Universe Types 11:07 UTC
+
+on:
+  schedule:
+    - cron: "7 11 * * *" # cada día 11:07 UTC
+  workflow_dispatch:
+
+concurrency:
+  group: eitypes-1d
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+  id-token: write
+
+jobs:
+  eitypes_task:
+    runs-on: ubuntu-latest
+    timeout-minutes: 360
+
+    env:
+      # BigQuery
+      PROJECT_ID: eve-market-sandbox
+      PROJECT_NUMBER: "791118475780"
+      LOCATION: EU
+      DATASET_ID: eve_market
+      TABLE_TYPES: types
+      TABLE_TYPES_DT: types_dt
+
+      # WIF (mismo pool/provider que ya usas en otros workflows)
+      WIF_PROVIDER: projects/791118475780/locations/global/workloadIdentityPools/eve-market-gh-poolv2/providers/github
+      SERVICE_ACCOUNT: eve-market-bq-loader@eve-market-sandbox.iam.gserviceaccount.com
+
+      # ESI
+      ESI_BASE: https://esi.evetech.net/latest
+      ESI_DATASOURCE: tranquility
+      ESI_LANGUAGE: en
+      USER_AGENT: "eve-esi-market-cloud-reader (github: loscamperoslozanopardo-dotcom/eve-esi-market-cloud-reader; job: eitypes_1d)"
+
+      # Runtime tuning
+      ESI_MAX_WORKERS: "20"
+      ESI_MAX_RPS: "15"
+
+      # State
+      STATE_FILE: state/eitypes_hdrs.json
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Restore state cache
+        uses: actions/cache@v4
+        with:
+          path: |
+            state/eitypes_hdrs.json
+          key: eitypes-state-v1-${{ github.run_id }}
+          restore-keys: |
+            eitypes-state-v1-
+
+      - name: Install deps (no requirements.txt)
+        run: |
+          python -m pip install --upgrade pip
+          pip install "google-cloud-bigquery>=3.0.0" "requests>=2.31.0"
+
+      - name: Auth to Google Cloud (WIF)
+        uses: google-github-actions/auth@v3
+        with:
+          workload_identity_provider: ${{ env.WIF_PROVIDER }}
+          service_account: ${{ env.SERVICE_ACCOUNT }}
+
+      - name: Run loader (with 3 retries, 10 min apart)
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          run_once() {
+            echo "=== Running eitypes loader at $(date -u +"%Y-%m-%dT%H:%M:%SZ") ==="
+            python src/eitypes_ld.py
+          }
+
+          if run_once; then
+            echo "Run succeeded on first attempt."
+            exit 0
+          fi
+
+          # 3 retries, 10 minutes apart
+          for i in 1 2 3; do
+            echo "Attempt $i failed. Sleeping 600s before retry..."
+            sleep 600
+            if run_once; then
+              echo "Run succeeded on retry $i."
+              exit 0
+            fi
+          done
+
+          echo "All retries failed."
+          exit 1
+
+      - name: Upload logs/state on failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: eitypes_failure_debug
+          path: |
+            state/eitypes_hdrs.json
